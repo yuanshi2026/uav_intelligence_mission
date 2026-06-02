@@ -190,6 +190,9 @@ class MicroUAVStage1FSM:
         # 2026-05-23 修改：所有航点都采用“远处正常飞、近处线性降速、到点刹停”的折中方案。
         self.route_slow_radius = float(self.control_cfg.get("route_slow_radius", 1.00))
         self.obs_slow_radius = float(self.control_cfg.get("obs_slow_radius", 0.80))
+        # 绕障中间点连续通过时使用更小的减速半径，避免每个折线点附近都明显降速。
+        # YAML 中也可通过 obs_fast_slow_radius 覆盖；默认比普通绕障点更快，但仍保留一定减速。
+        self.obs_fast_slow_radius = float(self.control_cfg.get("obs_fast_slow_radius", 0.45))
         self.scan_slow_radius = float(self.control_cfg.get("scan_slow_radius", 0.60))
         self.ring_slow_radius = float(self.control_cfg.get("ring_slow_radius", 0.80))
         self.land_slow_radius = float(self.control_cfg.get("land_slow_radius", 1.20))
@@ -549,6 +552,16 @@ class MicroUAVStage1FSM:
                     wp.control_mode = "position"
                 else:
                     wp.control_mode = "fusion"
+
+            # 2026-06-02 修改：绕障中间点不再按 position 点逐个刹停。
+            # OBS_ENTRY / OBS_EXIT 保持 position，用来稳定进入和退出绕障区；
+            # 其余 OBS_* 普通 route 点自动改为 fusion_route，靠近后直接切下一个点，实现连续通过。
+            if (
+                wp.kind == "route" and
+                wp.action == "none" and
+                self.is_obstacle_fast_pass_waypoint(wp.name)
+            ):
+                wp.control_mode = "fusion_route"
 
             if wp.control_mode not in ["position", "fusion", "fusion_route"]:
                 raise RuntimeError(
@@ -1357,12 +1370,27 @@ class MicroUAVStage1FSM:
     # 10. 航点导航控制区
     # =========================
 
+    def is_obstacle_fast_pass_waypoint(self, name):
+        """
+        判断是否为绕障中间连续通过点。
+        只让 OBS_ENTRY / OBS_EXIT 保留刹停，其余 OBS_* route 点默认不断停。
+        """
+        name_upper = str(name).upper()
+
+        if not name_upper.startswith("OBS"):
+            return False
+
+        return name_upper not in ["OBS_ENTRY", "OBS_EXIT"]
+
     def get_slow_radius(self, wp):
         """
         根据航点名称和控制模式选择减速半径。
         变量 slow_radius 的作用：当剩余距离小于该半径时，速度开始按距离线性下降。
         """
         name = wp.name.upper()
+
+        if self.is_obstacle_fast_pass_waypoint(name):
+            return self.obs_fast_slow_radius
 
         if name.startswith("RING"):
             return self.ring_slow_radius
