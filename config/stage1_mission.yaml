@@ -66,7 +66,7 @@ mission:
     # 距离减速参数：小于 slow_radius 后，速度按距离线性下降。
     # 这些参数是第一版保守值，先解决冲太快和刹不住，再逐步加速。
     route_slow_radius: 1.00
-    obs_slow_radius: 0.80
+    obs_slow_radius: 0.55
     scan_slow_radius: 0.60
     ring_slow_radius: 0.80
     land_slow_radius: 1.20
@@ -139,6 +139,9 @@ mission:
       hold_time: 0.50
 
     # 02 顺时针绕障：障碍物中心 (4.3, 0)，半径约 0.9 m
+    # 本版改为两圈绕障，每圈 8 个过渡点。
+    # OBS_ENTRY / OBS_EXIT 保留 position，用于进入和退出绕障时稳一下；
+    # 中间绕圈点全部使用 fusion_route，连续通过，不在每个点 BRAKE。
     - name: OBS_ENTRY
       kind: route
       control_mode: position
@@ -147,41 +150,186 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.55
-      acc: 0.40
+      speed: 0.45
+      acc: 0.35
 
-    - name: OBS_DOWN
+    # 第 1 圈：8 点近似圆形连续通过
+    - name: OBS1_P1
       kind: route
-      control_mode: position
+      control_mode: fusion_route
+      action: none
+      x: 3.66
+      y: 0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS1_P2
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 4.30
       y: 0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.40
-      acc: 0.32
+      speed: 0.48
+      acc: 0.38
 
-    - name: OBS_LEFT
+    - name: OBS1_P3
       kind: route
-      control_mode: position
+      control_mode: fusion_route
+      action: none
+      x: 4.94
+      y: 0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS1_P4
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 5.20
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.40
-      acc: 0.32
+      speed: 0.48
+      acc: 0.38
 
-    - name: OBS_UP
+    - name: OBS1_P5
       kind: route
-      control_mode: position
+      control_mode: fusion_route
+      action: none
+      x: 4.94
+      y: -0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS1_P6
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 4.30
       y: -0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.40
-      acc: 0.32
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS1_P7
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.66
+      y: -0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS1_P8
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.40
+      y: 0.00
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    # 第 2 圈：8 点近似圆形连续通过
+    - name: OBS2_P1
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.66
+      y: 0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P2
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 4.30
+      y: 0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P3
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 4.94
+      y: 0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P4
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 5.20
+      y: 0.00
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P5
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 4.94
+      y: -0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P6
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 4.30
+      y: -0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P7
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.66
+      y: -0.64
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
+
+    - name: OBS2_P8
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.40
+      y: 0.00
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.48
+      acc: 0.38
 
     - name: OBS_EXIT
       kind: route
@@ -191,8 +339,8 @@ mission:
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.55
-      acc: 0.40
+      speed: 0.45
+      acc: 0.35
 
     # 03 图片靶顺序：图片靶2 -> 图片靶1 -> 图片靶3 -> 图片靶4
     # 每个靶：先高处到正上方，再垂直下降投放判断，再原地爬升，避免低空横移。
