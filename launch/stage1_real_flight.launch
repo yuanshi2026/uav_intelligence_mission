@@ -18,6 +18,12 @@
     <arg name="start_livox" default="true" />
     <arg name="start_faster_lio" default="true" />
 
+    <!-- Real-flight MAVROS serial link, copied from the previous working launch. -->
+    <arg name="fcu_url" default="/dev/ttyTHS0:921600" />
+    <arg name="gcs_url" default="" />
+    <arg name="tgt_system" default="1" />
+    <arg name="tgt_component" default="1" />
+
     <!-- Mission nodes -->
     <arg name="start_fsm" default="true" />
     <arg name="start_vision" default="true" />
@@ -49,10 +55,16 @@
 
     <!-- External launch files -->
     <include if="$(arg start_mavros)"
-             file="$(find mavros)/launch/px4.launch" />
+             file="$(find mavros)/launch/px4.launch">
+        <arg name="fcu_url" value="$(arg fcu_url)" />
+        <arg name="gcs_url" value="$(arg gcs_url)" />
+        <arg name="tgt_system" value="$(arg tgt_system)" />
+        <arg name="tgt_component" value="$(arg tgt_component)" />
+    </include>
 
+    <!-- livox_ros_driver2 on this Jetson uses launch_ROS1/, not launch/. -->
     <include if="$(arg start_livox)"
-             file="$(find livox_ros_driver2)/launch/msg_MID360.launch" />
+             file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
 
     <include if="$(arg start_faster_lio)"
              file="$(find faster_lio)/launch/rflysim.launch" />
