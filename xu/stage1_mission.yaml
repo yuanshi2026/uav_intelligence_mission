@@ -30,6 +30,12 @@ mission:
   wait_real_image: false
   wait_real_ring: false
 
+  # 绕障圈数配置：只改 loop_count 即可控制绕几圈。
+  # 实飞第一次建议 1；确认稳定后可改 2。
+  obstacle:
+    loop_count: 1
+    max_loop_count: 8
+
   # 降落点映射
   # 当前按之前讨论：left -> 下方 H 点 (0, 1.6)，right -> 上方 H 点 (0, -1.6)。
   # 若现场二维码 left/right 的判定相反，只需要交换下面 left/right 的 y。
@@ -140,6 +146,19 @@ mission:
     ring_min_z: 1.35
     ring_max_z: 1.85
 
+
+    # 已知两个图片靶：固定点 + 短时间视觉微调 + 手控投放等待。
+    # 视觉来得及就小范围修正；视觉来不及就按固定点进入 3 秒手控等待，避免卡死。
+    fixed_image_align_min_wait: 0.15
+    fixed_image_align_timeout: 0.75
+    fixed_image_force_drop_timeout: 1.15
+    fixed_image_fallback_vel: 0.22
+    fixed_image_align_max_shift: 0.22
+    fixed_image_align_min_confidence: 0.45
+    fixed_image_align_min_stable_count: 1
+    manual_image_hover_time: 3.0
+    manual_image_no_auto_drop: true
+
   # 固定任务点
   waypoints:
     # 01 二维码扫描点：坐标系1中二维码为 (1.8, 0)
@@ -169,7 +188,10 @@ mission:
       speed: 0.85
       acc: 0.75
 
-    - name: OBS_DOWN
+    # 下面四个点是一圈绕障模板。FSM 会按 mission.obstacle.loop_count 自动复制。
+    # OBS_LOOP_P4 用于回到每圈起点侧，避免多圈时从 P3 斜切到 P1。
+    - name: OBS_LOOP_P1
+      obstacle_loop: true
       kind: route
       control_mode: fusion_route
       action: none
@@ -180,7 +202,8 @@ mission:
       speed: 0.90
       acc: 0.80
 
-    - name: OBS_LEFT
+    - name: OBS_LOOP_P2
+      obstacle_loop: true
       kind: route
       control_mode: fusion_route
       action: none
@@ -191,12 +214,25 @@ mission:
       speed: 0.90
       acc: 0.80
 
-    - name: OBS_UP
+    - name: OBS_LOOP_P3
+      obstacle_loop: true
       kind: route
       control_mode: fusion_route
       action: none
       x: 3.40
       y: -0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.90
+      acc: 0.80
+
+    - name: OBS_LOOP_P4
+      obstacle_loop: true
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.40
+      y: 0.90
       z: 1.35
       yaw_deg: 0.0
       speed: 0.90
@@ -233,7 +269,7 @@ mission:
     - name: IMG2_DROP_FIXED
       kind: scan
       control_mode: fusion
-      action: image_drop_1
+      action: image_drop_1_align_manual_wait
       x: 3.60
       y: -1.60
       z: 0.75
@@ -269,7 +305,7 @@ mission:
     - name: IMG1_DROP_FIXED
       kind: scan
       control_mode: fusion
-      action: image_drop_2
+      action: image_drop_2_align_manual_wait
       x: 1.80
       y: -1.60
       z: 0.75
