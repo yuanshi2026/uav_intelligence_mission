@@ -2867,12 +2867,18 @@ class MicroUAVStage1FSM:
         )
 
     def do_mission_done_action(self, wp, elapsed):
-        """完整航线结束后保持在降落点上方，等待 /uav/land 或人工确认。"""
+        """完整航线结束后在降落点上方短暂停稳，然后按配置自动降落。"""
         self.scan_enable_pub.publish(Bool(data=False))
 
         if elapsed > wp.hold_time:
-            rospy.loginfo("Mission route finished. Holding above landing point.")
-            self.enter_fsm_state("STAGE1_DONE")
+            auto_land = bool(self.landing_cfg.get("auto_land_after_mission", True))
+
+            if auto_land:
+                rospy.loginfo("Mission route finished. Auto landing from above landing point.")
+                self.request_normal_land("mission_done waypoint reached")
+            else:
+                rospy.loginfo("Mission route finished. Holding above landing point.")
+                self.enter_fsm_state("STAGE1_DONE")
             return
 
         rospy.loginfo_throttle(
