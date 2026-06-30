@@ -80,6 +80,10 @@ class UdpUavCmdReceiver:
         self.drop_step_delay = float(rospy.get_param("~drop_step_delay", 0.35))
         self.esp32_boot_wait = float(rospy.get_param("~esp32_boot_wait", 2.0))
         self.serial_reopen_interval = float(rospy.get_param("~serial_reopen_interval", 2.0))
+        # 串口命令可靠性参数：每条 L/R 命令最多发送 serial_retry_count 次。
+        # 只有读到 ESP32 回传 OK 才认为成功；读到 ERR 或超时未回 OK 会重发。
+        self.serial_retry_count = int(rospy.get_param("~serial_retry_count", 3))
+        self.serial_retry_delay = float(rospy.get_param("~serial_retry_delay", 0.12))
 
         self.esp32_ser = None
         self.serial_lock = threading.Lock()
@@ -87,6 +91,8 @@ class UdpUavCmdReceiver:
         self.last_serial_error = "NONE"
         self.last_serial_cmd = "NONE"
         self.last_serial_time = None
+        self.last_serial_attempts = 0
+        self.last_serial_reply = "NONE"
         self.last_drop_cmd = "NONE"
         self.last_drop_result = "NONE"
 
@@ -157,7 +163,7 @@ class UdpUavCmdReceiver:
         )
 
         rospy.logwarn(
-            "Drop mapping: image_drop_1->R1, special_drop->R3, image_drop_2->R2. ESP32 serial=%s @ %d enabled=%s",
+            "Drop mapping: image_drop_1->R1, image_drop_2->R3, special_drop->R2. ESP32 serial=%s @ %d enabled=%s",
             self.esp32_port,
             self.esp32_baud,
             str(self.drop_serial_enabled)
@@ -370,8 +376,35 @@ class UdpUavCmdReceiver:
 
         return lines
 
+    def evaluate_esp32_reply(self, cmd, lines):
+        """
+        判断 ESP32 是否真正执行了命令。
+        约定：drop.ino 正常会回传类似 "L1 OK" / "R2 OK"；若回传 ERR 或没有 OK，则认为本次发送失败。
+        """
+        if not lines:
+            return False, "NO_ACK"
+
+        upper_lines = [str(x).strip().upper() for x in lines if str(x).strip()]
+        if not upper_lines:
+            return False, "NO_ACK"
+
+        joined = " | ".join(upper_lines)
+
+        if any("ERR" in line for line in upper_lines):
+            return False, "ESP32_ERR:%s" % joined
+
+        expected = "%s OK" % cmd
+        if any(expected in line for line in upper_lines):
+            return True, "OK_REPLY:%s" % joined
+
+        # 兼容只回 OK 的固件；只要没有 ERR，且出现 OK，也认为成功。
+        if any("OK" in line for line in upper_lines):
+            return True, "OK_REPLY_GENERIC:%s" % joined
+
+        return False, "NO_OK_REPLY:%s" % joined
+
     def send_serial_cmd(self, cmd):
-        """给 ESP32 发送一条串口命令，例如 R1、L2。"""
+        """给 ESP32 发送一条串口命令，例如 R1、L2；最多重发 serial_retry_count 次。"""
         cmd = cmd.strip().upper()
 
         if not cmd:
@@ -384,31 +417,69 @@ class UdpUavCmdReceiver:
             return False, "SERIAL_NOT_READY:%s" % self.last_serial_error
 
         data = (cmd + "\n").encode("utf-8")
+        max_try = max(1, int(getattr(self, "serial_retry_count", 3)))
+        retry_delay = max(0.0, float(getattr(self, "serial_retry_delay", 0.12)))
 
-        with self.serial_lock:
-            try:
-                self.esp32_ser.write(data)
-                self.esp32_ser.flush()
-            except Exception as e:
-                self.last_serial_error = str(e)
+        all_lines = []
+        last_reason = "NO_ATTEMPT"
+        actual_attempts = 0
+
+        for attempt in range(1, max_try + 1):
+            actual_attempts = attempt
+
+            with self.serial_lock:
                 try:
-                    if self.esp32_ser is not None:
-                        self.esp32_ser.close()
-                except Exception:
-                    pass
-                self.esp32_ser = None
-                return False, "SERIAL_WRITE_ERR:%s" % str(e)
+                    # 清掉上一次命令或 ESP32 刚复位时残留的串口输出，避免把旧 ERR 当作本次回复。
+                    try:
+                        self.esp32_ser.reset_input_buffer()
+                    except Exception:
+                        pass
 
-            esp_lines = self.read_esp32_lines()
+                    self.esp32_ser.write(data)
+                    self.esp32_ser.flush()
+                except Exception as e:
+                    self.last_serial_error = str(e)
+                    try:
+                        if self.esp32_ser is not None:
+                            self.esp32_ser.close()
+                    except Exception:
+                        pass
+                    self.esp32_ser = None
+                    self.last_serial_cmd = cmd
+                    self.last_serial_time = rospy.Time.now()
+                    self.last_serial_attempts = attempt
+                    self.last_serial_reply = " | ".join(all_lines) if all_lines else "NONE"
+                    return False, "SERIAL_WRITE_ERR:%s" % str(e)
+
+                esp_lines = self.read_esp32_lines()
+
+            if esp_lines:
+                all_lines.extend(["try%d:%s" % (attempt, line) for line in esp_lines])
+                rospy.logwarn("ESP32 reply for %s try %d/%d: %s", cmd, attempt, max_try, " | ".join(esp_lines))
+            else:
+                rospy.logwarn("ESP32 no reply for %s try %d/%d", cmd, attempt, max_try)
+
+            ok, reason = self.evaluate_esp32_reply(cmd, esp_lines)
+            last_reason = reason
+
+            if ok:
+                self.last_serial_cmd = cmd
+                self.last_serial_time = rospy.Time.now()
+                self.last_serial_error = "OK"
+                self.last_serial_attempts = attempt
+                self.last_serial_reply = " | ".join(all_lines) if all_lines else "NONE"
+                return True, "SERIAL_OK:try=%d" % attempt
+
+            if attempt < max_try:
+                rospy.logwarn("ESP32 command %s failed on try %d/%d: %s, retry...", cmd, attempt, max_try, reason)
+                rospy.sleep(retry_delay)
 
         self.last_serial_cmd = cmd
         self.last_serial_time = rospy.Time.now()
-        self.last_serial_error = "OK"
-
-        if esp_lines:
-            rospy.logwarn("ESP32 reply for %s: %s", cmd, " | ".join(esp_lines))
-
-        return True, "SERIAL_OK"
+        self.last_serial_error = last_reason
+        self.last_serial_attempts = actual_attempts
+        self.last_serial_reply = " | ".join(all_lines) if all_lines else "NONE"
+        return False, "SERIAL_NO_OK_AFTER_%d:%s" % (actual_attempts, last_reason)
 
     def is_single_drop_cmd(self, cmd):
         """单个舵机指令：L1/L2/L3/R1/R2/R3。"""
@@ -468,6 +539,8 @@ class UdpUavCmdReceiver:
             "esp32_baud=%d;"
             "last_serial_cmd=%s;"
             "last_serial_error=%s;"
+            "last_serial_attempts=%d;"
+            "last_serial_reply=%s;"
             "last_drop_cmd=%s;"
             "last_drop_result=%s"
         ) % (
@@ -476,6 +549,8 @@ class UdpUavCmdReceiver:
             self.esp32_baud,
             self.last_serial_cmd,
             self.last_serial_error,
+            self.last_serial_attempts,
+            self.last_serial_reply,
             self.last_drop_cmd,
             self.last_drop_result
         )
