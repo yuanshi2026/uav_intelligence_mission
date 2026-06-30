@@ -24,16 +24,27 @@ mission:
     max_wait: 5.0
     min_height: 1.20
 
-  # 正式比赛建议 true；如果只想单独调航线，可临时改 false。
+  # 真实视觉版：二维码、图片靶、圆环都由视觉节点给结果。
+  # QR 超时不会中止任务；若未识别到二维码，后续按默认航线继续完成任务。
   wait_real_qr: true
   wait_real_image: true
   wait_real_ring: true
+
+  # 绕障圈数配置：只改 loop_count 即可控制绕几圈。
+  # 实飞第一次建议 1；确认稳定后可改 2。
+  obstacle:
+    loop_count: 3
+    max_loop_count: 8
 
   # 降落点映射
   # 当前按之前讨论：left -> 下方 H 点 (0, 1.6)，right -> 上方 H 点 (0, -1.6)。
   # 若现场二维码 left/right 的判定相反，只需要交换下面 left/right 的 y。
   landing:
-    default_side: left
+    # 真实视觉版不强制 left/right；二维码失败时回退 default_side。
+    force_side: ""
+    default_side: right
+    # 到达 LAND_FINAL_DYNAMIC 后自动切 AUTO.LAND，不再只悬停等待 /uav/land。
+    auto_land_after_mission: true
     approach_x: 1.00
     # 切 AUTO.LAND 前先用 OFFBOARD 锁当前位置和固定 yaw，降低切模式瞬间机身扭转。
     # 普通 land 准备时间稍长；stop 急停准备时间很短，只用于让 yaw setpoint 平滑交接。
@@ -56,6 +67,9 @@ mission:
     rate_hz: 30.0
 
     yaw_eps_deg: 5.0
+    # 只有快速通过点跳过 YAW_ALIGN 时使用这个更严格的阈值。
+    # 普通 YAW_ALIGN 仍按 yaw_eps_deg 判断，跳过原地对齐必须小于 3°。
+    skip_yaw_align_eps_deg: 3.0
     yaw_break_eps_deg: 12.0
 
     # 普通 route 点也会走位置 + 速度融合控制。
@@ -96,8 +110,15 @@ mission:
 
   # 动作耗时参数
   action:
-    qr_scan_timeout: 3.0
-    image_scan_time: 1.2
+    qr_scan_timeout: 5.00
+    image_scan_time: 0.45
+    # 图片靶真实视觉两阶段：先在 1.35m 分类，匹配二维码才下降到 image_drop_z 对准投放。
+    image_class_scan_time: 0.80
+    image_class_min_confidence: 0.55
+    image_class_min_stable_count: 1
+    image_drop_z: 0.70
+    image_descend_timeout: 2.50
+    image_descend_pos_eps: 0.12
     drop_time: 1.0
     hold_after_action: 0.25
     # ACTION 软判稳：防止识别/投放动作被轻微抖动无限卡住。
@@ -116,12 +137,11 @@ mission:
     align_min_confidence: 0.75
     align_min_stable_count: 3
 
-    # 圆环视觉搜索 / 穿越参数
-    # 视觉节点负责输出当前机体系下的 forward_m、offset_y_m、offset_z_m。
-    # FSM 在 RING_SEARCH_START 锁定圆环中心，动态生成 RING_PRE / RING_CENTER / RING_POST；
-    # 在 RING_PRE 再做一次左右/高度对准，然后连续穿过圆环。
+    # 圆环真实视觉参数。
+    # 搜索成功时用视觉动态生成 RING_PRE / RING_CENTER / RING_POST；
+    # 搜索失败时按 ring_timeout_policy 决定是否走 YAML 固定兜底点。
     ring_search_timeout: 5.0
-    ring_timeout_policy: hold   # hold：视觉失败原地等；fixed：失败后用 YAML 固定点继续；skip：失败后直接继续下个点
+    ring_timeout_policy: fixed  # fixed：圆环视觉超时后继续走 YAML 固定穿环点，保证任务不断线
     ring_pre_distance: 0.65
     ring_post_distance: 0.80
     ring_align_timeout: 4.0
@@ -134,6 +154,19 @@ mission:
     ring_forward_max: 3.50
     ring_min_z: 1.35
     ring_max_z: 1.85
+
+
+    # 固定图片靶动作的旧参数保留备用。
+    # 当前真实视觉版主要使用 image_scan_maybe_drop，不再走手控等待动作。
+    fixed_image_align_min_wait: 0.15
+    fixed_image_align_timeout: 0.75
+    fixed_image_force_drop_timeout: 1.15
+    fixed_image_fallback_vel: 0.22
+    fixed_image_align_max_shift: 0.22
+    fixed_image_align_min_confidence: 0.45
+    fixed_image_align_min_stable_count: 1
+    manual_image_hover_time: 3.0
+    manual_image_no_auto_drop: true
 
   # 固定任务点
   waypoints:
@@ -164,7 +197,10 @@ mission:
       speed: 0.85
       acc: 0.75
 
-    - name: OBS_DOWN
+    # 下面四个点是一圈绕障模板。FSM 会按 mission.obstacle.loop_count 自动复制。
+    # OBS_LOOP_P4 用于回到每圈起点侧，避免多圈时从 P3 斜切到 P1。
+    - name: OBS_LOOP_P1
+      obstacle_loop: true
       kind: route
       control_mode: fusion_route
       action: none
@@ -175,7 +211,8 @@ mission:
       speed: 0.90
       acc: 0.80
 
-    - name: OBS_LEFT
+    - name: OBS_LOOP_P2
+      obstacle_loop: true
       kind: route
       control_mode: fusion_route
       action: none
@@ -186,12 +223,25 @@ mission:
       speed: 0.90
       acc: 0.80
 
-    - name: OBS_UP
+    - name: OBS_LOOP_P3
+      obstacle_loop: true
       kind: route
       control_mode: fusion_route
       action: none
       x: 3.40
       y: -0.90
+      z: 1.35
+      yaw_deg: 0.0
+      speed: 0.90
+      acc: 0.80
+
+    - name: OBS_LOOP_P4
+      obstacle_loop: true
+      kind: route
+      control_mode: fusion_route
+      action: none
+      x: 3.40
+      y: 0.90
       z: 1.35
       yaw_deg: 0.0
       speed: 0.90
@@ -208,151 +258,145 @@ mission:
       speed: 0.85
       acc: 0.75
 
-    # 03 图片靶顺序：图片靶2 -> 图片靶1 -> 图片靶3 -> 图片靶4
-    # 每个靶：先高处到正上方，再垂直下降投放判断，再原地爬升，避免低空横移。
+    # 03 图片靶真实视觉逻辑：
+    # 每个候选图片靶先走 *_OVER 保持原航线，再在同坐标 *_SCAN 做高空分类。
+    # 若类别不是二维码要求，SCAN 动作会在高空短扫后跳过，不下降、不投放；
+    # 若类别匹配二维码，FSM 会内部下降到 image_drop_z，对准后自动发布 image_drop_1 / image_drop_2。
+    # 两个二维码目标都投完后，后续 *_SCAN 会在进入导航前直接跳过，*_OVER 仍保持原路线。
     - name: IMG2_OVER
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 3.60
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.58
-      acc: 0.55
-      hold_time: 0.15
+      speed: 0.90
+      acc: 0.85
 
-    - name: IMG2_DROP
+    - name: IMG2_SCAN
       kind: scan
       control_mode: fusion
       action: image_scan_maybe_drop
       x: 3.60
       y: -1.60
-      z: 0.75
+      z: 1.35
       yaw_deg: 0.0
-      speed: 0.36
-      acc: 0.34
-      hold_time: 0.35
+      speed: 0.48
+      acc: 0.42
+      hold_time: 0.15
 
     - name: IMG2_UP
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 3.60
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.50
-      acc: 0.48
-      hold_time: 0.10
+      speed: 0.85
+      acc: 0.80
 
     - name: IMG1_OVER
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 1.80
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.58
-      acc: 0.55
-      hold_time: 0.15
+      speed: 0.90
+      acc: 0.85
 
-    - name: IMG1_DROP
+    - name: IMG1_SCAN
       kind: scan
       control_mode: fusion
       action: image_scan_maybe_drop
       x: 1.80
       y: -1.60
-      z: 0.75
+      z: 1.35
       yaw_deg: 0.0
-      speed: 0.36
-      acc: 0.34
-      hold_time: 0.35
+      speed: 0.48
+      acc: 0.42
+      hold_time: 0.15
 
     - name: IMG1_UP
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 1.80
       y: -1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.50
-      acc: 0.48
-      hold_time: 0.10
+      speed: 0.85
+      acc: 0.80
 
     - name: IMG3_OVER
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 1.80
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.58
-      acc: 0.55
-      hold_time: 0.15
+      speed: 1.00
+      acc: 0.85
 
-    - name: IMG3_DROP
+    - name: IMG3_SCAN
       kind: scan
       control_mode: fusion
       action: image_scan_maybe_drop
       x: 1.80
       y: 1.60
-      z: 0.75
+      z: 1.35
       yaw_deg: 0.0
-      speed: 0.36
-      acc: 0.34
-      hold_time: 0.35
+      speed: 0.48
+      acc: 0.42
+      hold_time: 0.15
 
     - name: IMG3_UP
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 1.80
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.50
-      acc: 0.48
-      hold_time: 0.10
+      speed: 0.85
+      acc: 0.80
 
     - name: IMG4_OVER
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 3.60
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.58
-      acc: 0.55
-      hold_time: 0.15
+      speed: 1.00
+      acc: 0.85
 
-    - name: IMG4_DROP
+    - name: IMG4_SCAN
       kind: scan
       control_mode: fusion
       action: image_scan_maybe_drop
       x: 3.60
       y: 1.60
-      z: 0.75
+      z: 1.35
       yaw_deg: 0.0
-      speed: 0.36
-      acc: 0.34
-      hold_time: 0.35
-
+      speed: 0.48
+      acc: 0.42
+      hold_time: 0.15
     - name: IMG4_UP
-      kind: scan
-      control_mode: fusion
+      kind: route
+      control_mode: fusion_route
       action: none
       x: 3.60
       y: 1.60
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.50
-      acc: 0.48
-      hold_time: 0.10
+      speed: 0.85
+      acc: 0.80
 
     # 04 特殊靶：中心 (6.0, 1.0)
     - name: SPECIAL_OVER
@@ -391,32 +435,44 @@ mission:
       acc: 0.48
       hold_time: 0.10
 
-    # 05 圆环：默认点只作为视觉失败或单独调航线时的 fallback。
-    # 正常流程：RING_SEARCH_START 停稳识别圆环 -> 动态生成 RING_PRE / RING_CENTER / RING_POST；
-    # RING_PRE 再做一次左右/高度对准 -> RING_CENTER 和 RING_POST 连续通过。
+    # 05 圆环：真实视觉版。
+    # 前置相机朝机体 +x，先在 TURN_TO_RING 转到 -90 deg，使相机/机头朝世界 -y。
+    # RING_SEARCH_START 识别圆环并动态生成 PRE/CENTER/POST；若识别超时则按 YAML 固定点兜底继续。
+    - name: TURN_TO_RING
+      kind: scan
+      control_mode: fusion
+      action: none
+      x: 6.00
+      y: 1.00
+      z: 1.40
+      yaw_deg: -90.0
+      speed: 0.45
+      acc: 0.42
+      hold_time: 0.20
+
     - name: RING_SEARCH_START
       kind: scan
       control_mode: fusion
       action: ring_search
-      x: 4.80
-      y: -1.60
-      z: 1.60
-      yaw_deg: 0.0
-      speed: 0.45
-      acc: 0.42
-      hold_time: 0.30
+      x: 6.00
+      y: -0.75
+      z: 1.40
+      yaw_deg: -90.0
+      speed: 0.58
+      acc: 0.52
+      hold_time: 0.20
 
     - name: RING_PRE
       kind: scan
       control_mode: fusion
       action: ring_pre_align
-      x: 5.20
-      y: -1.60
-      z: 1.60
-      yaw_deg: 0.0
-      speed: 0.40
-      acc: 0.38
-      hold_time: 0.20
+      x: 6.00
+      y: -1.00
+      z: 1.40
+      yaw_deg: -90.0
+      speed: 0.52
+      acc: 0.48
+      hold_time: 0.15
 
     - name: RING_CENTER
       kind: route
@@ -424,31 +480,30 @@ mission:
       action: none
       x: 6.00
       y: -1.60
-      z: 1.60
-      yaw_deg: 0.0
-      speed: 0.50
-      acc: 0.45
+      z: 1.40
+      yaw_deg: -90.0
+      speed: 0.90
+      acc: 0.80
 
     - name: RING_POST
       kind: route
       control_mode: fusion_route
       action: none
-      x: 6.80
-      y: -1.60
-      z: 1.60
-      yaw_deg: 0.0
-      speed: 0.60
-      acc: 0.50
-
+      x: 6.00
+      y: -2.10
+      z: 1.40
+      yaw_deg: -90.0
+      speed: 1.00
+      acc: 0.85
     # 06 回降落区：先走上侧安全通道，再在 x=1.0 处切到目标降落点 y，避免斜穿障碍物附近。
     - name: LAND_TOP_CORRIDOR
       kind: route
       control_mode: position
       action: none
-      x: 6.80
-      y: -2.20
+      x: 6.00
+      y: -2.00
       z: 1.35
-      yaw_deg: 0.0
+      yaw_deg: -90.0
       speed: 0.80
       acc: 0.70
 
@@ -457,9 +512,9 @@ mission:
       control_mode: position
       action: none
       x: 1.00
-      y: -2.20
+      y: -2.00
       z: 1.35
-      yaw_deg: 0.0
+      yaw_deg: -90.0
       speed: 0.95
       acc: 0.80
 
@@ -471,7 +526,7 @@ mission:
       x: 1.00
       y: 0.00
       z: 1.35
-      yaw_deg: 0.0
+      yaw_deg: -90.0
       speed: 0.75
       acc: 0.70
 
@@ -483,7 +538,7 @@ mission:
       x: 0.00
       y: 0.00
       z: 1.35
-      yaw_deg: 0.0
+      yaw_deg: -90.0
       speed: 0.38
       acc: 0.35
       hold_time: 1.00
