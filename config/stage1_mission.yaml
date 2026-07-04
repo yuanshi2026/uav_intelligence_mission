@@ -39,11 +39,34 @@ mission:
     class_2: apple
     landing_side: right
 
-  # 绕障圈数配置：只改 loop_count 即可控制绕几圈。
-  # 实飞第一次建议 1；确认稳定后可改 2。
+  # 圆形绕障配置：障碍物中心来自比赛地图。
+  # 地图中：起飞点 (1500,3000) mm，障碍物中心 (5800,3000) mm。
+  # 当前代码坐标系以起飞点为 (0,0)，单位 m，且 y 与地图 y 方向相反，
+  # 因此障碍物中心为 x=(5800-1500)/1000=4.30，y=(3000-3000)/1000=0.00。
+  # 这里采用位置 + 速度前馈 + 加速度前馈连续发布的圆形轨迹。
   obstacle:
+    mode: circle_feedforward
     loop_count: 3
     max_loop_count: 8
+    center_x: 4.30
+    center_y: 0.00
+    radius: 0.90
+    height: 1.35
+    circle_speed: 0.75
+    ramp_time: 2.00
+    direction: clockwise
+    # 从障碍物下侧进入圆：start_angle=90deg，对应起点 (4.30, 0.90)。
+    # 这样 QR_SCAN -> OBS_ENTRY -> OBS_CIRCLE_START 不会斜穿障碍物。
+    start_angle_deg: 90.0
+    yaw_mode: fixed
+    finish_pos_eps: 0.18
+    finish_vel_th: 0.25
+    finish_stable_time: 0.20
+    # 圆轨迹结束后，不再允许单纯等超时就切下一个点；
+    # 只有达到严格判稳，或者超时后仍满足软判稳，才允许退出绕圆。
+    finish_max_wait: 1.50
+    finish_soft_pos_eps: 0.30
+    finish_soft_vel_th: 0.35
 
   # 降落点映射
   # 当前按之前讨论：left -> 下方 H 点 (0, 1.6)，right -> 上方 H 点 (0, -1.6)。
@@ -199,9 +222,11 @@ mission:
       acc: 0.48
       hold_time: 0.50
 
-   # 02 顺时针绕障：改回四点菱形绕障，减少密集小航点导致的频繁降速。
-    # OBS_ENTRY / OBS_EXIT 保留 position，用于进入和退出绕障区；
-    # OBS_DOWN / OBS_LEFT / OBS_UP 使用 fusion_route，连续通过，不在每个菱形顶点 BRAKE。
+    # 02 顺时针圆形绕障：半径 0.90m，高度 1.35m。
+    # 障碍物中心为 (4.30, 0.00)，来自比赛地图 (5800,3000) mm 相对起飞点 (1500,3000) mm 的换算。
+    # OBS_ENTRY 先把飞机带到障碍物下侧安全切入区；
+    # OBS_CIRCLE_START 到达圆起点后执行 circle_obstacle 动作，FSM 内部连续发布位置 + 速度 + 加速度前馈；
+    # OBS_EXIT 用于绕圆结束后回到右侧安全通道，再继续图片靶任务。
     - name: OBS_ENTRY
       kind: route
       control_mode: position
@@ -210,69 +235,31 @@ mission:
       y: 0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.85
-      acc: 0.75
+      speed: 0.75
+      acc: 0.70
 
-    # 下面四个点是一圈绕障模板。FSM 会按 mission.obstacle.loop_count 自动复制。
-    # OBS_LOOP_P4 用于回到每圈起点侧，避免多圈时从 P3 斜切到 P1。
-    - name: OBS_LOOP_P1
-      obstacle_loop: true
-      kind: route
-      control_mode: fusion_route
-      action: none
-      x: 5.20
+    - name: OBS_CIRCLE_START
+      kind: scan
+      control_mode: fusion
+      action: circle_obstacle
+      x: 4.30
       y: 0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.90
-      acc: 0.80
-
-    - name: OBS_LOOP_P2
-      obstacle_loop: true
-      kind: route
-      control_mode: fusion_route
-      action: none
-      x: 5.20
-      y: -0.90
-      z: 1.35
-      yaw_deg: 0.0
-      speed: 0.90
-      acc: 0.80
-
-    - name: OBS_LOOP_P3
-      obstacle_loop: true
-      kind: route
-      control_mode: fusion_route
-      action: none
-      x: 3.40
-      y: -0.90
-      z: 1.35
-      yaw_deg: 0.0
-      speed: 0.90
-      acc: 0.80
-
-    - name: OBS_LOOP_P4
-      obstacle_loop: true
-      kind: route
-      control_mode: fusion_route
-      action: none
-      x: 3.40
-      y: 0.90
-      z: 1.35
-      yaw_deg: 0.0
-      speed: 0.90
-      acc: 0.80
+      speed: 0.46
+      acc: 0.45
+      hold_time: 0.15
 
     - name: OBS_EXIT
       kind: route
       control_mode: position
       action: none
       x: 3.40
-      y: 0.10
+      y: 0.90
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.85
-      acc: 0.75
+      speed: 0.75
+      acc: 0.70
 
     # 03 图片靶真实视觉逻辑：
     # 每个候选图片靶先走 *_OVER 保持原航线，再在同坐标 *_SCAN 做高空分类。

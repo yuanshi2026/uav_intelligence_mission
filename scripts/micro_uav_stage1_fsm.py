@@ -160,6 +160,7 @@ class MicroUAVStage1FSM:
         self.action_cfg = self.mission_cfg["mission"].get("action", {})
         self.takeoff_cfg = self.mission_cfg["mission"].get("takeoff", {})
         self.landing_cfg = self.mission_cfg["mission"].get("landing", {})
+        self.obstacle_cfg = self.mission_cfg["mission"].get("obstacle", {})
         self.qr_default_cfg = self.mission_cfg["mission"].get("qr_default", {})
         self.qr_default_enabled = bool(self.qr_default_cfg.get("enabled", True))
         self.qr_default_class_1 = str(self.qr_default_cfg.get("class_1", "")).strip().lower()
@@ -175,6 +176,28 @@ class MicroUAVStage1FSM:
 
         # ---------- 控制频率 ----------
         self.rate_hz = float(self.control_cfg.get("rate_hz", 30.0))
+
+        # ---------- 圆形绕障参数 ----------
+        # 障碍物中心坐标使用任务 YAML 中的相对起飞点坐标，单位 m。
+        # 比赛地图中起飞点为 (1500,3000) mm，障碍物中心为 (5800,3000) mm，
+        # 在当前代码坐标系下换算为 (4.30, 0.00) m。
+        self.obstacle_mode = str(self.obstacle_cfg.get("mode", "waypoint_loop")).strip().lower()
+        self.circle_center_x = float(self.obstacle_cfg.get("center_x", 4.30))
+        self.circle_center_y = float(self.obstacle_cfg.get("center_y", 0.00))
+        self.circle_radius = float(self.obstacle_cfg.get("radius", 0.90))
+        self.circle_height = float(self.obstacle_cfg.get("height", 1.35))
+        self.circle_speed = float(self.obstacle_cfg.get("circle_speed", 0.75))
+        self.circle_ramp_time = float(self.obstacle_cfg.get("ramp_time", 2.00))
+        self.circle_direction = str(self.obstacle_cfg.get("direction", "clockwise")).strip().lower()
+        self.circle_start_angle_deg = float(self.obstacle_cfg.get("start_angle_deg", 90.0))
+        self.circle_yaw_mode = str(self.obstacle_cfg.get("yaw_mode", "fixed")).strip().lower()
+        self.circle_finish_pos_eps = float(self.obstacle_cfg.get("finish_pos_eps", 0.18))
+        self.circle_finish_vel_th = float(self.obstacle_cfg.get("finish_vel_th", 0.25))
+        self.circle_finish_stable_time = float(self.obstacle_cfg.get("finish_stable_time", 0.20))
+        self.circle_finish_max_wait = float(self.obstacle_cfg.get("finish_max_wait", 1.50))
+        # 圆形绕障结束后软退出条件：只作为噪声兜底，不能只靠超时直接进入下一个航点。
+        self.circle_finish_soft_pos_eps = float(self.obstacle_cfg.get("finish_soft_pos_eps", 0.30))
+        self.circle_finish_soft_vel_th = float(self.obstacle_cfg.get("finish_soft_vel_th", 0.35))
 
         # ---------- 判稳防卡死参数 ----------
         # 速度差分得到的加速度在实机上很容易被定位/速度噪声放大。
@@ -437,6 +460,10 @@ class MicroUAVStage1FSM:
         self.dynamic_ring_points = {}
         self.ring_dynamic_ready = False
         self.ring_last_debug = {}
+
+        # ---------- 圆形绕障运行时缓存 ----------
+        self.circle_finish_start_time = None
+        self.circle_finish_stable_start_time = None
 
         # ---------- ROS 发布 ----------
         self.raw_pub = rospy.Publisher(
@@ -1040,6 +1067,34 @@ class MicroUAVStage1FSM:
 
         self.raw_pub.publish(msg)
 
+    def publish_position_velocity_accel_yaw(self, x, y, z, vx, vy, vz, ax, ay, az, yaw):
+        """
+        发布位置 + 速度前馈 + 加速度前馈 + yaw 指令。
+        用于圆形绕障这类连续轨迹。位置约束圆轨迹，速度给出切向前馈，
+        加速度给出向心/切向加速度前馈，三者必须来自同一条轨迹。
+        """
+        msg = self.make_target_msg()
+
+        # 不忽略位置、速度、加速度，只忽略 yaw_rate。
+        # 未设置 FORCE 位时，acceleration_or_force 按加速度前馈解释。
+        msg.type_mask = PositionTarget.IGNORE_YAW_RATE
+
+        msg.position.x = x
+        msg.position.y = y
+        msg.position.z = z
+
+        msg.velocity.x = vx
+        msg.velocity.y = vy
+        msg.velocity.z = vz
+
+        msg.acceleration_or_force.x = ax
+        msg.acceleration_or_force.y = ay
+        msg.acceleration_or_force.z = az
+
+        msg.yaw = yaw
+
+        self.raw_pub.publish(msg)
+
     def publish_position_yaw(self, x, y, z, yaw):
         """
         发布纯位置 + yaw 指令。
@@ -1251,6 +1306,8 @@ class MicroUAVStage1FSM:
             self.action_hold_target = None
             self.drop_sent_time = None
             self.reset_image_action_runtime()
+            self.circle_finish_start_time = None
+            self.circle_finish_stable_start_time = None
 
         rospy.loginfo("NAV_PHASE -> %s", new_phase)
 
@@ -1284,6 +1341,8 @@ class MicroUAVStage1FSM:
             self.dynamic_ring_points = {}
             self.ring_dynamic_ready = False
             self.ring_last_debug = {}
+            self.circle_finish_start_time = None
+            self.circle_finish_stable_start_time = None
 
         self.nav_phase = "INIT"
         self.locked_yaw = self.current_yaw
@@ -2439,6 +2498,270 @@ class MicroUAVStage1FSM:
             clamp(cz + self.ring_align_gain * dz_local, self.ring_min_z, self.ring_max_z)
         ]
 
+    def get_circle_loop_count(self):
+        """读取并限制圆形绕障圈数。"""
+        try:
+            loop_count = int(self.obstacle_cfg.get("loop_count", 1))
+        except Exception:
+            loop_count = 1
+
+        try:
+            max_loop_count = int(self.obstacle_cfg.get("max_loop_count", 8))
+        except Exception:
+            max_loop_count = 8
+
+        return int(clamp(loop_count, 1, max(1, max_loop_count)))
+
+    def get_circle_direction_sign(self):
+        """返回圆形绕障方向。当前代码坐标系下，clockwise 使用 theta 递减。"""
+        if self.circle_direction in ["ccw", "counterclockwise", "anticlockwise", "逆时针"]:
+            return 1.0
+
+        return -1.0
+
+    def get_circle_center_abs(self):
+        """把 YAML 中的绕障圆心相对坐标转换成 MAVROS local 绝对坐标。"""
+        if self.frame_mode == "relative_home":
+            return self.home_x + self.circle_center_x, self.home_y + self.circle_center_y
+
+        return self.circle_center_x, self.circle_center_y
+
+    def circle_trapezoid_profile(self, elapsed, omega, ramp_time, total_angle):
+        """
+        生成平滑绕圆角度进度。
+        返回：phi, phi_dot, phi_ddot, total_time, finished。
+        phi 为已经走过的角度长度，单位 rad，始终为正；方向在外部乘 direction_sign。
+        """
+        omega = max(1e-4, abs(omega))
+        ramp_time = max(0.0, ramp_time)
+        total_angle = max(0.0, total_angle)
+
+        if total_angle <= 1e-6:
+            return 0.0, 0.0, 0.0, 0.0, True
+
+        # 如果圈数很小或 ramp_time 太长，自动降级成三角速度曲线，避免恒速段为负。
+        if ramp_time <= 1e-3 or total_angle <= omega * ramp_time:
+            peak_omega = math.sqrt(total_angle * omega / max(ramp_time, total_angle / omega))
+            peak_omega = max(1e-4, min(omega, peak_omega))
+            accel_time = total_angle / peak_omega
+            total_time = 2.0 * accel_time
+            alpha = peak_omega / accel_time
+
+            if elapsed < accel_time:
+                phi = 0.5 * alpha * elapsed * elapsed
+                phi_dot = alpha * elapsed
+                phi_ddot = alpha
+                return phi, phi_dot, phi_ddot, total_time, False
+
+            if elapsed < total_time:
+                tau = elapsed - accel_time
+                phi = 0.5 * total_angle + peak_omega * tau - 0.5 * alpha * tau * tau
+                phi_dot = max(0.0, peak_omega - alpha * tau)
+                phi_ddot = -alpha
+                return phi, phi_dot, phi_ddot, total_time, False
+
+            return total_angle, 0.0, 0.0, total_time, True
+
+        alpha = omega / ramp_time
+        const_time = total_angle / omega - ramp_time
+        total_time = 2.0 * ramp_time + const_time
+
+        if elapsed < ramp_time:
+            phi = 0.5 * alpha * elapsed * elapsed
+            phi_dot = alpha * elapsed
+            phi_ddot = alpha
+            return phi, phi_dot, phi_ddot, total_time, False
+
+        if elapsed < ramp_time + const_time:
+            tau = elapsed - ramp_time
+            phi = 0.5 * omega * ramp_time + omega * tau
+            phi_dot = omega
+            phi_ddot = 0.0
+            return phi, phi_dot, phi_ddot, total_time, False
+
+        if elapsed < total_time:
+            tau = elapsed - ramp_time - const_time
+            phi_before_down = 0.5 * omega * ramp_time + omega * const_time
+            phi = phi_before_down + omega * tau - 0.5 * alpha * tau * tau
+            phi_dot = max(0.0, omega - alpha * tau)
+            phi_ddot = -alpha
+            return phi, phi_dot, phi_ddot, total_time, False
+
+        return total_angle, 0.0, 0.0, total_time, True
+
+    def calc_circle_setpoint(self, elapsed):
+        """根据当前绕圆时间计算位置、速度前馈、加速度前馈和调试信息。"""
+        cx, cy = self.get_circle_center_abs()
+        cz = self.mission_z_to_abs(self.circle_height)
+
+        radius = max(0.10, self.circle_radius)
+        speed = max(0.05, self.circle_speed)
+        omega = speed / radius
+        loop_count = self.get_circle_loop_count()
+        total_angle = 2.0 * math.pi * loop_count
+        direction_sign = self.get_circle_direction_sign()
+        theta_start = math.radians(self.circle_start_angle_deg)
+
+        phi, phi_dot_abs, phi_ddot_abs, total_time, finished = self.circle_trapezoid_profile(
+            elapsed,
+            omega,
+            self.circle_ramp_time,
+            total_angle
+        )
+
+        theta = theta_start + direction_sign * phi
+        theta_dot = direction_sign * phi_dot_abs
+        theta_ddot = direction_sign * phi_ddot_abs
+
+        x = cx + radius * math.cos(theta)
+        y = cy + radius * math.sin(theta)
+        z = cz
+
+        vx = -radius * math.sin(theta) * theta_dot
+        vy = radius * math.cos(theta) * theta_dot
+        vz = 0.0
+
+        ax = -radius * math.cos(theta) * theta_dot * theta_dot - radius * math.sin(theta) * theta_ddot
+        ay = -radius * math.sin(theta) * theta_dot * theta_dot + radius * math.cos(theta) * theta_ddot
+        az = 0.0
+
+        if self.circle_yaw_mode in ["tangent", "follow", "切线"] and abs(phi_dot_abs) > 1e-3:
+            yaw = math.atan2(vy, vx)
+        else:
+            yaw = self.locked_yaw
+
+        debug = {
+            "theta": theta,
+            "theta_dot": theta_dot,
+            "theta_ddot": theta_ddot,
+            "omega": omega,
+            "loop_count": loop_count,
+            "total_time": total_time,
+            "finished": finished,
+            "center_x": cx,
+            "center_y": cy,
+            "center_z": cz,
+        }
+
+        return x, y, z, vx, vy, vz, ax, ay, az, yaw, debug
+
+    def process_circle_obstacle_action(self, wp):
+        """执行圆形绕障：连续发布位置 + 速度前馈 + 加速度前馈。"""
+        if self.action_start_time is None:
+            self.action_start_time = rospy.Time.now()
+
+        now = rospy.Time.now()
+        elapsed = (now - self.action_start_time).to_sec()
+
+        x, y, z, vx, vy, vz, ax, ay, az, yaw, debug = self.calc_circle_setpoint(elapsed)
+
+        self.publish_position_velocity_accel_yaw(
+            x, y, z,
+            vx, vy, vz,
+            ax, ay, az,
+            yaw
+        )
+
+        if not debug["finished"]:
+            rospy.loginfo_throttle(
+                0.5,
+                "[CIRCLE_OBS] wp=%s t=%.2f/%.2f loop=%d center=(%.2f,%.2f) r=%.2f v=%.2f theta=%.1fdeg theta_dot=%.2f pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) acc=(%.2f,%.2f)",
+                wp.name,
+                elapsed,
+                debug["total_time"],
+                debug["loop_count"],
+                debug["center_x"],
+                debug["center_y"],
+                self.circle_radius,
+                self.circle_speed,
+                math.degrees(debug["theta"]),
+                debug["theta_dot"],
+                x, y, z,
+                vx, vy,
+                ax, ay
+            )
+            self.circle_finish_start_time = None
+            self.circle_finish_stable_start_time = None
+            return
+
+        # 轨迹结束后，锁住圆起点/终点并确认速度降下来，再进入下一个航点，避免退出瞬间横向窜动。
+        cx_now, cy_now, cz_now = self.current_xyz()
+        pos_err = norm3(x - cx_now, y - cy_now, z - cz_now)
+        stable = (
+            pos_err < self.circle_finish_pos_eps and
+            self.current_speed < self.circle_finish_vel_th
+        )
+
+        if self.circle_finish_start_time is None:
+            self.circle_finish_start_time = now
+            self.circle_finish_stable_start_time = None
+
+        finish_wait = (now - self.circle_finish_start_time).to_sec()
+
+        if stable:
+            if self.circle_finish_stable_start_time is None:
+                self.circle_finish_stable_start_time = now
+
+            stable_time = (now - self.circle_finish_stable_start_time).to_sec()
+        else:
+            self.circle_finish_stable_start_time = None
+            stable_time = 0.0
+
+        # 严格退出：位置和速度都满足，并且连续稳定达到指定时间。
+        strict_finish_ready = stable_time >= self.circle_finish_stable_time
+
+        # 软退出：只在等待超过 finish_max_wait 后启用，且仍必须满足一个更宽松的位置/速度条件。
+        # 注意：这里故意不能写成“只要超时就退出”，否则可能还没真正回到圆终点就切下一个航点。
+        soft_finish_ready = (
+            finish_wait >= self.circle_finish_max_wait and
+            pos_err < self.circle_finish_soft_pos_eps and
+            self.current_speed < self.circle_finish_soft_vel_th
+        )
+
+        if strict_finish_ready or soft_finish_ready:
+            if soft_finish_ready and not strict_finish_ready:
+                rospy.logwarn(
+                    "[CIRCLE_OBS_FINISH_SOFT] wp=%s pos_err=%.2f<%.2f speed=%.2f<%.2f wait=%.2f/%.2f",
+                    wp.name,
+                    pos_err,
+                    self.circle_finish_soft_pos_eps,
+                    self.current_speed,
+                    self.circle_finish_soft_vel_th,
+                    finish_wait,
+                    self.circle_finish_max_wait
+                )
+            else:
+                rospy.loginfo(
+                    "[CIRCLE_OBS_FINISH] wp=%s pos_err=%.2f speed=%.2f stable=%.2f",
+                    wp.name,
+                    pos_err,
+                    self.current_speed,
+                    stable_time
+                )
+
+            self.circle_finish_start_time = None
+            self.circle_finish_stable_start_time = None
+            self.disable_scan_request()
+            self.next_waypoint()
+            return
+
+        rospy.loginfo_throttle(
+            0.5,
+            "[CIRCLE_OBS_FINISH_WAIT] wp=%s pos_err=%.2f strict_eps=%.2f soft_eps=%.2f speed=%.2f strict_th=%.2f soft_th=%.2f stable=%.2f/%.2f wait=%.2f/%.2f soft=%s",
+            wp.name,
+            pos_err,
+            self.circle_finish_pos_eps,
+            self.circle_finish_soft_pos_eps,
+            self.current_speed,
+            self.circle_finish_vel_th,
+            self.circle_finish_soft_vel_th,
+            stable_time,
+            self.circle_finish_stable_time,
+            finish_wait,
+            self.circle_finish_max_wait,
+            str(soft_finish_ready)
+        )
+
     def send_drop_once(self, drop_cmd):
         """只发送一次投放命令，并记录投放开始时间。"""
         if self.action_sent:
@@ -2505,6 +2828,10 @@ class MicroUAVStage1FSM:
             if wp.action == "ring_pre_align":
                 self.vision_results.pop("ring_gate", None)
 
+            if wp.action == "circle_obstacle":
+                self.circle_finish_start_time = None
+                self.circle_finish_stable_start_time = None
+
         hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
 
         # ACTION 阶段始终发布当前悬停目标。视觉对准时 action_hold_target 会在原航点附近更新。
@@ -2517,6 +2844,10 @@ class MicroUAVStage1FSM:
             0.0,
             self.locked_yaw
         )
+
+        if wp.action == "circle_obstacle":
+            self.process_circle_obstacle_action(wp)
+            return
 
         if self.action_requires_static_hover(wp):
             stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
