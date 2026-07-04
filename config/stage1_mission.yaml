@@ -157,6 +157,9 @@ mission:
     image_descend_pos_eps: 0.12
     # 低空对准超时后，force_drop 表示已确认类别且已下降时直接投一次，尽量拿分；skip 表示跳过。
     image_align_timeout_policy: force_drop
+    # 新增兜底：如果剩余图片靶扫描点数量 == 剩余图片靶投放物块数量，
+    # 当前图片靶不再等待高空分类匹配，直接下降到低空对准投放。
+    image_force_drop_remaining_equal: true
 
     drop_time: 1.0
     hold_after_action: 0.25

@@ -315,6 +315,12 @@ class MicroUAVStage1FSM:
         self.image_align_timeout_policy = str(
             self.action_cfg.get("image_align_timeout_policy", "force_drop")
         ).strip().lower()
+        # 兜底策略：如果“剩余未扫描图片靶数量 == 剩余未投图片物块数量”，
+        # 说明再继续等分类的意义不大，当前图片靶应直接进入“下降 + 视觉对准 + 投放”流程。
+        # 这样可以避免前面已经排除/错过若干图片靶后，最后几个目标因为分类不稳定而白白跳过。
+        self.image_force_drop_remaining_equal = bool(
+            self.action_cfg.get("image_force_drop_remaining_equal", True)
+        )
 
         self.drop_time = float(self.action_cfg.get("drop_time", 1.2))
         self.hold_after_action = float(self.action_cfg.get("hold_after_action", 0.3))
@@ -1196,6 +1202,88 @@ class MicroUAVStage1FSM:
             self.target_class_2_done = True
             self.image_drop_count += 1
             return
+
+    def get_remaining_image_drop_count(self):
+        """统计还需要投到图片靶上的物块数量。"""
+        remaining = 0
+
+        if self.qr_class_1.strip() != "" and not self.target_class_1_done:
+            remaining += 1
+
+        if self.qr_class_2.strip() != "" and not self.target_class_2_done:
+            remaining += 1
+
+        return remaining
+
+    def get_remaining_image_scan_count(self):
+        """统计从当前航点开始，后面还剩几个图片靶扫描航点。"""
+        start_index = max(0, self.wp_index)
+        remaining = 0
+
+        for wp in self.waypoints[start_index:]:
+            if wp.action == "image_scan_maybe_drop":
+                remaining += 1
+
+        return remaining
+
+    def get_next_pending_image_drop_cmd(self):
+        """选择下一个还没用过的图片靶投放命令。"""
+        if self.qr_class_1.strip() != "" and not self.target_class_1_done:
+            return "image_drop_1"
+
+        if self.qr_class_2.strip() != "" and not self.target_class_2_done:
+            return "image_drop_2"
+
+        return ""
+
+    def should_force_image_drop_by_remaining_count(self):
+        """
+        判断是否启用“剩余图片靶数 == 剩余投放物块数”的兜底投放逻辑。
+
+        返回：
+        should_force: 是否应强制把当前图片靶当作目标靶处理；
+        drop_cmd: 本次使用的投放命令；
+        remaining_scans: 剩余图片靶扫描航点数量；
+        remaining_drops: 剩余图片靶投放物块数量。
+        """
+        remaining_scans = self.get_remaining_image_scan_count()
+        remaining_drops = self.get_remaining_image_drop_count()
+
+        if not self.image_force_drop_remaining_equal:
+            return False, "", remaining_scans, remaining_drops
+
+        if remaining_drops <= 0 or remaining_scans <= 0:
+            return False, "", remaining_scans, remaining_drops
+
+        if remaining_scans != remaining_drops:
+            return False, "", remaining_scans, remaining_drops
+
+        drop_cmd = self.get_next_pending_image_drop_cmd()
+        if drop_cmd == "":
+            return False, "", remaining_scans, remaining_drops
+
+        return True, drop_cmd, remaining_scans, remaining_drops
+
+    def start_image_descend_for_drop(self, wp, tx, ty, drop_abs_z, drop_cmd, img_class, reason):
+        """
+        统一进入图片靶下降投放流程。
+        不管是“分类匹配”还是“剩余数量兜底”，后续都走同一套下降、视觉对准、投放逻辑。
+        """
+        self.pending_drop_cmd = drop_cmd
+        self.pending_image_class = img_class
+        self.image_action_phase = "DESCEND"
+        self.image_phase_start_time = rospy.Time.now()
+        self.action_hold_target = [tx, ty, drop_abs_z]
+        self.vision_results.pop("image_target", None)
+
+        rospy.loginfo(
+            "[IMAGE_START_DESCEND] wp=%s class=%s cmd=%s reason=%s descend_to_z=%.2f",
+            wp.name,
+            img_class,
+            drop_cmd,
+            reason,
+            self.image_drop_z
+        )
 
     def should_skip_waypoint_before_nav(self, wp):
         """在进入 YAW_ALIGN/MOVE 前跳过无需执行的航点，避免多余到点/hold。"""
@@ -3091,6 +3179,37 @@ class MicroUAVStage1FSM:
         if self.image_action_phase == "CLASS_SCAN":
             # 高空分类阶段固定在 YAML 的 IMGx_SCAN 高度，不做 x/y 视觉对准。
             self.action_hold_target = [tx, ty, tz]
+
+            # 新增兜底逻辑：如果剩余图片靶扫描点数量已经等于剩余图片靶投放数量，
+            # 当前图片靶就不再继续赌分类结果，直接下降到低空，走视觉对准后投放。
+            # 例如还剩 2 个 IMG*_SCAN，同时还有 2 个二维码目标没投，
+            # 那么后面两个图片靶必须都尝试投放，否则很容易因为分类超时丢分。
+            force_drop, force_drop_cmd, remaining_scans, remaining_drops = (
+                self.should_force_image_drop_by_remaining_count()
+            )
+            if force_drop:
+                img_class = self.current_image_class.strip().lower()
+                if img_class == "":
+                    img_class = "remaining_equal_unknown"
+
+                rospy.logwarn(
+                    "[IMAGE_REMAINING_EQUAL_FORCE] wp=%s remaining_scans=%d remaining_drops=%d cmd=%s",
+                    wp.name,
+                    remaining_scans,
+                    remaining_drops,
+                    force_drop_cmd
+                )
+                self.start_image_descend_for_drop(
+                    wp,
+                    tx,
+                    ty,
+                    drop_abs_z,
+                    force_drop_cmd,
+                    img_class,
+                    "remaining_equal"
+                )
+                return
+
             data, reason = self.get_latest_vision_result(
                 "image_target",
                 min_confidence=self.image_class_min_confidence
@@ -3193,19 +3312,14 @@ class MicroUAVStage1FSM:
                 )
                 return
 
-            self.pending_drop_cmd = drop_cmd
-            self.pending_image_class = img_class
-            self.image_action_phase = "DESCEND"
-            self.image_phase_start_time = rospy.Time.now()
-            self.action_hold_target = [tx, ty, drop_abs_z]
-            self.vision_results.pop("image_target", None)
-
-            rospy.loginfo(
-                "[IMAGE_TARGET_MATCH] wp=%s class=%s cmd=%s descend_to_z=%.2f",
-                wp.name,
-                img_class,
+            self.start_image_descend_for_drop(
+                wp,
+                tx,
+                ty,
+                drop_abs_z,
                 drop_cmd,
-                self.image_drop_z
+                img_class,
+                "class_match"
             )
             return
 
