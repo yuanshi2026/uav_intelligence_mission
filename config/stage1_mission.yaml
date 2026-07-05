@@ -50,12 +50,12 @@ mission:
     max_loop_count: 8
     center_x: 4.30
     center_y: 0.00
-    radius: 1.00
+    radius: 1.10
     height: 1.35
     circle_speed: 1.00
     # 1m/s 绕 1m 半径圆时，向心加速度前馈为 1.00m/s^2。
     # ramp_time 控制切向加减速，1.50s 比原 2.00s 略激进，但仍避免突然满速。
-    ramp_time: 1.50
+    ramp_time: 1.60
     direction: clockwise
     # 从圆左侧直接入圆/出圆：start_angle=180deg，对应半径 1.00m 的圆起点 (3.30, 0.00)。
     start_angle_deg: 180.0
