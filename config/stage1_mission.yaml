@@ -50,12 +50,12 @@ mission:
     max_loop_count: 8
     center_x: 4.30
     center_y: 0.00
-    radius: 0.90
+    radius: 1.00
     height: 1.35
-    circle_speed: 0.75
+    circle_speed: 1.00
     ramp_time: 2.00
     direction: clockwise
-    # 从障碍物下侧进入圆：start_angle=90deg，对应起点 (4.30, 0.90)。
+    # 从障碍物下侧切向进入圆：start_angle=90deg，对应半径 1.00m 的圆起点 (4.30, 1.00)。
     # 这样 QR_SCAN -> OBS_ENTRY -> OBS_CIRCLE_START 不会斜穿障碍物。
     start_angle_deg: 90.0
     yaw_mode: fixed
@@ -172,12 +172,23 @@ mission:
     # 视觉节点负责像素 -> 米制偏差；FSM 只使用 offset_x_m / offset_y_m 做小范围移动。
     vision_result_timeout: 0.50
     image_align_timeout: 4.0
-    special_align_timeout: 4.0
+    special_align_timeout: 2.50
     align_xy_eps: 0.05
     align_step_max: 0.15
     align_gain: 0.80
     align_min_confidence: 0.75
     align_min_stable_count: 3
+
+    # 特殊靶专用瞄准/兜底投放参数。
+    # 特殊靶不需要类别识别，只需要识别靶心偏差用于瞄准；若瞄准超时，则在已到达低空投放点且速度较低时强制投放一次。
+    special_align_xy_eps: 0.08
+    special_min_confidence: 0.60
+    special_min_stable_count: 2
+    special_force_drop_enabled: true
+    special_force_drop_timeout: 2.50
+    special_force_drop_allow_no_vision: true
+    special_force_drop_pos_eps: 0.22
+    special_force_drop_vel: 0.25
 
     # 圆环真实视觉参数。
     # 搜索成功时用视觉动态生成 RING_PRE / RING_CENTER / RING_POST；
@@ -225,17 +236,17 @@ mission:
       acc: 0.48
       hold_time: 0.50
 
-    # 02 顺时针圆形绕障：半径 0.90m，高度 1.35m。
+    # 02 顺时针圆形绕障：半径 1.00m，高度 1.35m。
     # 障碍物中心为 (4.30, 0.00)，来自比赛地图 (5800,3000) mm 相对起飞点 (1500,3000) mm 的换算。
     # OBS_ENTRY 先把飞机带到障碍物下侧安全切入区；
     # OBS_CIRCLE_START 到达圆起点后执行 circle_obstacle 动作，FSM 内部连续发布位置 + 速度 + 加速度前馈；
-    # OBS_EXIT 用于绕圆结束后回到右侧安全通道，再继续图片靶任务。
+    # OBS_EXIT 用于绕圆结束后回到左侧中线通道 (3.40, 0.00)，方便直接飞向第一个图片靶。
     - name: OBS_ENTRY
       kind: route
       control_mode: position
       action: none
       x: 3.40
-      y: 0.90
+      y: 1.00
       z: 1.35
       yaw_deg: 0.0
       speed: 0.75
@@ -246,7 +257,7 @@ mission:
       control_mode: fusion
       action: circle_obstacle
       x: 4.30
-      y: 0.90
+      y: 1.00
       z: 1.35
       yaw_deg: 0.0
       speed: 0.46
@@ -258,7 +269,7 @@ mission:
       control_mode: position
       action: none
       x: 3.40
-      y: 0.90
+      y: 0.00
       z: 1.35
       yaw_deg: 0.0
       speed: 0.75
@@ -273,8 +284,8 @@ mission:
       kind: route
       control_mode: fusion_route
       action: none
-      x: 3.60
-      y: -1.60
+      x: 3.52
+      y: -1.77
       z: 1.35
       yaw_deg: 0.0
       speed: 0.90
@@ -284,8 +295,8 @@ mission:
       kind: scan
       control_mode: fusion
       action: image_scan_maybe_drop
-      x: 3.60
-      y: -1.60
+      x: 3.52
+      y: -1.77
       z: 1.35
       yaw_deg: 0.0
       speed: 0.48
@@ -296,8 +307,8 @@ mission:
       kind: route
       control_mode: fusion_route
       action: none
-      x: 3.60
-      y: -1.60
+      x: 3.52
+      y: -1.77
       z: 1.35
       yaw_deg: 0.0
       speed: 0.85
@@ -307,8 +318,8 @@ mission:
       kind: route
       control_mode: fusion_route
       action: none
-      x: 1.80
-      y: -1.60
+      x: 1.71
+      y: -1.66
       z: 1.35
       yaw_deg: 0.0
       speed: 0.90
@@ -318,8 +329,8 @@ mission:
       kind: scan
       control_mode: fusion
       action: image_scan_maybe_drop
-      x: 1.80
-      y: -1.60
+      x: 1.71
+      y: -1.66
       z: 1.35
       yaw_deg: 0.0
       speed: 0.48
@@ -330,8 +341,8 @@ mission:
       kind: route
       control_mode: fusion_route
       action: none
-      x: 1.80
-      y: -1.60
+      x: 1.71
+      y: -1.66
       z: 1.35
       yaw_deg: 0.0
       speed: 0.85

@@ -340,6 +340,33 @@ class MicroUAVStage1FSM:
         self.align_min_confidence = float(self.action_cfg.get("align_min_confidence", 0.75))
         self.align_min_stable_count = int(self.action_cfg.get("align_min_stable_count", 3))
 
+        # 特殊靶专用参数：特殊靶只做靶心瞄准，不做类别识别。
+        # 这里单独放宽特殊靶条件，避免影响图片靶分类/投放逻辑。
+        self.special_align_xy_eps = float(
+            self.action_cfg.get("special_align_xy_eps", self.align_xy_eps)
+        )
+        self.special_min_confidence = float(
+            self.action_cfg.get("special_min_confidence", self.align_min_confidence)
+        )
+        self.special_min_stable_count = int(
+            self.action_cfg.get("special_min_stable_count", self.align_min_stable_count)
+        )
+        self.special_force_drop_enabled = bool(
+            self.action_cfg.get("special_force_drop_enabled", True)
+        )
+        self.special_force_drop_timeout = float(
+            self.action_cfg.get("special_force_drop_timeout", self.special_align_timeout)
+        )
+        self.special_force_drop_allow_no_vision = bool(
+            self.action_cfg.get("special_force_drop_allow_no_vision", True)
+        )
+        self.special_force_drop_pos_eps = float(
+            self.action_cfg.get("special_force_drop_pos_eps", 0.22)
+        )
+        self.special_force_drop_vel = float(
+            self.action_cfg.get("special_force_drop_vel", 0.25)
+        )
+
         # ---------- 已知图片靶固定点微调 / 手控投放等待参数 ----------
         # 两个已知图片靶不再等待分类，只允许视觉做短时间小范围修正；
         # 实飞手控投放模式下，瞄准完成或超时后悬停 manual_image_hover_time 秒。
@@ -3795,10 +3822,56 @@ class MicroUAVStage1FSM:
             elapsed
         )
 
+    def special_force_drop_ready(self, wp, tx, ty, tz, elapsed, reason):
+        """
+        特殊靶兜底投放判定。
+        特殊靶位置是已知航点，视觉只用于小范围瞄准；如果瞄准失败，
+        只要飞机已经基本停在低空投放点附近，就强制投一次，避免完全丢掉特殊靶动作分。
+        """
+        if not self.special_force_drop_enabled:
+            return False
+
+        if elapsed < self.special_force_drop_timeout:
+            return False
+
+        hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
+        cx, cy, cz = self.current_xyz()
+        pos_err = norm3(hold_tx - cx, hold_ty - cy, hold_tz - cz)
+
+        ready = (
+            pos_err < self.special_force_drop_pos_eps and
+            self.current_speed < self.special_force_drop_vel
+        )
+
+        if ready:
+            self.send_drop_once("special_drop")
+            rospy.logwarn(
+                "[SPECIAL_FORCE_DROP] wp=%s reason=%s elapsed=%.2f pos_err=%.3f vel=%.3f",
+                wp.name,
+                reason,
+                elapsed,
+                pos_err,
+                self.current_speed
+            )
+            return True
+
+        rospy.logwarn_throttle(
+            0.5,
+            "[SPECIAL_FORCE_WAIT] reason=%s elapsed=%.2f pos_err=%.3f/%.3f vel=%.3f/%.3f",
+            reason,
+            elapsed,
+            pos_err,
+            self.special_force_drop_pos_eps,
+            self.current_speed,
+            self.special_force_drop_vel
+        )
+        return False
+
     def do_special_align_drop_action(self, wp, tx, ty, tz, elapsed):
         """
-        特殊靶视觉对准 + 投放。
-        视觉节点需要通过 /uav/vision_result 提供 special_target 的 offset_x_m、offset_y_m。
+        特殊靶瞄准 + 投放。
+        说明：特殊靶不需要做类别识别，只需要视觉节点给出 special_target 的靶心偏差，
+        FSM 根据 offset_x_m / offset_y_m 做小范围对准；若瞄准超时，则执行兜底强制投放。
         """
         self.scan_enable_pub.publish(Bool(data=True))
         self.scan_target_pub.publish(String(data="special_target"))
@@ -3822,13 +3895,10 @@ class MicroUAVStage1FSM:
             self.send_drop_once("special_drop")
             return
 
-        if elapsed > self.special_align_timeout:
-            rospy.logwarn("Special target align timeout at %s, skip.", wp.name)
-            self.disable_scan_request()
-            self.next_waypoint()
-            return
-
-        data, reason = self.get_latest_vision_result("special_target")
+        data, reason = self.get_latest_vision_result(
+            "special_target",
+            min_confidence=self.special_min_confidence
+        )
 
         if data is None:
             rospy.loginfo_throttle(
@@ -3838,6 +3908,9 @@ class MicroUAVStage1FSM:
                 reason,
                 elapsed
             )
+            # 特殊靶是已知定点：即使视觉一直没给出有效偏差，超时后也允许在低速、近点条件下强制投放。
+            if self.special_force_drop_allow_no_vision:
+                self.special_force_drop_ready(wp, tx, ty, tz, elapsed, "no_vision_%s" % reason)
             return
 
         ok_offset, offset_x, offset_y = self.get_vision_offset_xy(data)
@@ -3848,57 +3921,74 @@ class MicroUAVStage1FSM:
                 "Special target %s has no valid offset_x_m/offset_y_m.",
                 wp.name
             )
+            if self.special_force_drop_allow_no_vision:
+                self.special_force_drop_ready(wp, tx, ty, tz, elapsed, "invalid_offset")
             return
 
         offset_norm = math.sqrt(offset_x * offset_x + offset_y * offset_y)
+        stable_count = int(data.get("stable_count", 1))
+        confidence = float(data.get("confidence", 1.0))
 
-        if offset_norm > self.align_xy_eps:
+        if offset_norm > self.special_align_xy_eps:
             self.update_action_hold_target_by_vision(tz, offset_x, offset_y)
 
             rospy.loginfo_throttle(
                 0.5,
-                "[SPECIAL_ALIGN] wp=%s offset=(%.3f, %.3f) norm=%.3f target=(%.2f, %.2f, %.2f)",
+                "[SPECIAL_ALIGN] wp=%s offset=(%.3f, %.3f) norm=%.3f/%.3f conf=%.2f stable=%d target=(%.2f, %.2f, %.2f)",
                 wp.name,
                 offset_x,
                 offset_y,
                 offset_norm,
+                self.special_align_xy_eps,
+                confidence,
+                stable_count,
                 self.action_hold_target[0],
                 self.action_hold_target[1],
                 self.action_hold_target[2]
             )
+            # 视觉有偏差但迟迟对不准时，也允许到达兜底时间后强制投放。
+            self.special_force_drop_ready(wp, tx, ty, tz, elapsed, "align_timeout")
             return
-
-        stable_count = int(data.get("stable_count", 1))
-        confidence = float(data.get("confidence", 1.0))
 
         hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
         hold_stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
 
+        # 特殊靶条件比图片靶放宽：只要求靶心偏差进入范围、置信度/稳定帧达标，且飞机基本停稳。
+        # 如果长时间因定位噪声达不到严格 hold_stable，则下面的强制投放兜底会处理。
         ready_to_drop = (
-            confidence >= self.align_min_confidence and
-            stable_count >= self.align_min_stable_count and
+            confidence >= self.special_min_confidence and
+            stable_count >= self.special_min_stable_count and
             hold_stable
         )
 
         if ready_to_drop:
             self.send_drop_once("special_drop")
             rospy.loginfo(
-                "Special target aligned and dropped: wp=%s offset=%.3f",
+                "[SPECIAL_DROP] aligned wp=%s offset=%.3f conf=%.2f stable=%d pos_err=%.3f",
                 wp.name,
-                offset_norm
+                offset_norm,
+                confidence,
+                stable_count,
+                pos_err
             )
+            return
+
+        if self.special_force_drop_ready(wp, tx, ty, tz, elapsed, "ready_wait_timeout"):
             return
 
         rospy.loginfo_throttle(
             0.5,
-            "[SPECIAL_READY_WAIT] wp=%s offset=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
+            "[SPECIAL_READY_WAIT] wp=%s offset=%.3f/%.3f conf=%.2f/%.2f stable=%d/%d pos_err=%.3f hold_stable=%s elapsed=%.2f",
             wp.name,
             offset_norm,
+            self.special_align_xy_eps,
             confidence,
+            self.special_min_confidence,
             stable_count,
-            self.align_min_stable_count,
+            self.special_min_stable_count,
             pos_err,
-            str(hold_stable)
+            str(hold_stable),
+            elapsed
         )
 
     def do_drop_only_action(self, wp, drop_name, elapsed):
