@@ -387,6 +387,8 @@ class MicroUAVStage1FSM:
         self.ring_timeout_policy = str(self.action_cfg.get("ring_timeout_policy", "hold")).lower()
         self.ring_pre_distance = float(self.action_cfg.get("ring_pre_distance", 0.65))
         self.ring_post_distance = float(self.action_cfg.get("ring_post_distance", 0.80))
+        # 穿环后动态横移点：RING_POST 后保持同一 y，再沿 x 方向朝降落区移动一段距离。
+        self.ring_exit_x_distance = float(self.action_cfg.get("ring_exit_x_distance", 0.0))
         self.ring_align_timeout = float(self.action_cfg.get("ring_align_timeout", 4.0))
         self.ring_yz_eps = float(self.action_cfg.get("ring_yz_eps", 0.07))
         self.ring_align_step_max = float(self.action_cfg.get("ring_align_step_max", 0.12))
@@ -1350,16 +1352,42 @@ class MicroUAVStage1FSM:
         return side
 
     def get_dynamic_land_xy(self, wp):
-        """动态降落点坐标：LAND_APPROACH 只替换 y，LAND_FINAL 替换 x/y。"""
+        """
+        根据二维码 left/right 动态生成降落相关航点坐标。
+
+        设计意图：
+        1. LAND_PRE_DYNAMIC：先飞到最终 H 点前方的预降速点，用来把从圆环后方回来的速度收下来；
+        2. LAND_APPROACH_DYNAMIC：保留旧配置兼容，作用和 LAND_PRE_DYNAMIC 类似；
+        3. LAND_FINAL_DYNAMIC：最终 H 点上方，悬停判稳后触发 mission_done / 降落。
+        """
         side = self.get_selected_land_side()
         side_cfg = self.landing_cfg.get(side, {})
 
         land_x = float(side_cfg.get("x", wp.x))
         land_y = float(side_cfg.get("y", wp.y))
 
+        if wp.name.startswith("LAND_PRE"):
+            # 预降速点默认使用 landing.pre_x；未配置时复用旧的 approach_x。
+            # 当前比赛坐标里最终 H 点 x 通常为 0.0，pre_x=1.0 表示先到 H 点前方 1m 处收速。
+            pre_x = float(self.landing_cfg.get("pre_x", self.landing_cfg.get("approach_x", wp.x)))
+            return pre_x, land_y
+
         if wp.name.startswith("LAND_APPROACH"):
             approach_x = float(self.landing_cfg.get("approach_x", wp.x))
             return approach_x, land_y
+
+        return land_x, land_y
+
+    def get_selected_land_abs_xy(self):
+        """读取当前二维码选择的最终降落点，并转换成 MAVROS local 绝对坐标。"""
+        side = self.get_selected_land_side()
+        side_cfg = self.landing_cfg.get(side, {})
+
+        land_x = float(side_cfg.get("x", 0.0))
+        land_y = float(side_cfg.get("y", 0.0))
+
+        if self.frame_mode == "relative_home":
+            return self.home_x + land_x, self.home_y + land_y
 
         return land_x, land_y
 
@@ -2559,11 +2587,21 @@ class MicroUAVStage1FSM:
         post_x = center_x + ux * self.ring_post_distance
         post_y = center_y + uy * self.ring_post_distance
 
+        # 穿环后接续点：到圆环后方 post_distance 后，保持同一 y，沿 x 方向朝最终降落点移动 ring_exit_x_distance。
+        # 这样避免 RING_POST 后立刻被固定 LAND_TOP_CORRIDOR 拉回，造成“穿过头又倒退”。
+        exit_x = post_x
+        exit_y = post_y
+        if self.ring_exit_x_distance > 1e-6:
+            land_abs_x, _ = self.get_selected_land_abs_xy()
+            x_sign = -1.0 if post_x >= land_abs_x else 1.0
+            exit_x = post_x + x_sign * self.ring_exit_x_distance
+
         if update_pre:
             self.dynamic_ring_points["RING_PRE"] = (pre_x, pre_y, center_z)
 
         self.dynamic_ring_points["RING_CENTER"] = (center_x, center_y, center_z)
         self.dynamic_ring_points["RING_POST"] = (post_x, post_y, center_z)
+        self.dynamic_ring_points["RING_EXIT_X"] = (exit_x, exit_y, center_z)
 
         self.ring_dynamic_ready = True
         self.ring_last_debug = {
@@ -2577,10 +2615,12 @@ class MicroUAVStage1FSM:
             "pre_y": pre_y,
             "post_x": post_x,
             "post_y": post_y,
+            "exit_x": exit_x,
+            "exit_y": exit_y,
         }
 
         rospy.loginfo(
-            "Ring dynamic points updated: PRE=(%.2f, %.2f, %.2f) CENTER=(%.2f, %.2f, %.2f) POST=(%.2f, %.2f, %.2f)",
+            "Ring dynamic points updated: PRE=(%.2f, %.2f, %.2f) CENTER=(%.2f, %.2f, %.2f) POST=(%.2f, %.2f, %.2f) EXIT_X=(%.2f, %.2f, %.2f)",
             pre_x,
             pre_y,
             center_z,
@@ -2589,6 +2629,9 @@ class MicroUAVStage1FSM:
             center_z,
             post_x,
             post_y,
+            center_z,
+            exit_x,
+            exit_y,
             center_z
         )
 
@@ -2778,9 +2821,17 @@ class MicroUAVStage1FSM:
         )
 
         if not debug["finished"]:
+            # 实飞排查用：同时打印实际位置到圆心的半径，判断是目标圆有问题，还是飞机实际跟踪切内圈/外扩。
+            cx_now, cy_now, _ = self.current_xyz()
+            actual_r = math.sqrt(
+                (cx_now - debug["center_x"]) * (cx_now - debug["center_x"]) +
+                (cy_now - debug["center_y"]) * (cy_now - debug["center_y"])
+            )
+            radial_err = actual_r - self.circle_radius
+
             rospy.loginfo_throttle(
                 0.5,
-                "[CIRCLE_OBS] wp=%s t=%.2f/%.2f loop=%d center=(%.2f,%.2f) r=%.2f v=%.2f theta=%.1fdeg theta_dot=%.2f pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) acc=(%.2f,%.2f)",
+                "[CIRCLE_OBS] wp=%s t=%.2f/%.2f loop=%d center=(%.2f,%.2f) r_cmd=%.2f r_actual=%.2f radial_err=%.2f v=%.2f theta=%.1fdeg theta_dot=%.2f pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) acc=(%.2f,%.2f)",
                 wp.name,
                 elapsed,
                 debug["total_time"],
@@ -2788,6 +2839,8 @@ class MicroUAVStage1FSM:
                 debug["center_x"],
                 debug["center_y"],
                 self.circle_radius,
+                actual_r,
+                radial_err,
                 self.circle_speed,
                 math.degrees(debug["theta"]),
                 debug["theta_dot"],
@@ -2947,9 +3000,17 @@ class MicroUAVStage1FSM:
                 self.circle_finish_start_time = None
                 self.circle_finish_stable_start_time = None
 
+        # 圆形绕障是连续轨迹控制，必须保持 setpoint 流干净。
+        # 注意：这里不能像二维码/图片靶/特殊靶动作那样，先发布“当前位置悬停、速度为 0”的 hold setpoint，
+        # 再发布圆轨迹 setpoint。否则飞控会在同一个 ACTION 周期内先收到“停住”，又收到“绕圆”，
+        # 位置/速度/加速度前馈会被静止目标污染，实飞容易出现绕圆半径收缩、跟踪不干净。
+        if wp.action == "circle_obstacle":
+            self.process_circle_obstacle_action(wp)
+            return
+
         hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
 
-        # ACTION 阶段始终发布当前悬停目标。视觉对准时 action_hold_target 会在原航点附近更新。
+        # 其他 ACTION 阶段才发布当前悬停目标。视觉对准时 action_hold_target 会在原航点附近更新。
         self.publish_position_velocity_yaw(
             hold_tx,
             hold_ty,
@@ -2959,10 +3020,6 @@ class MicroUAVStage1FSM:
             0.0,
             self.locked_yaw
         )
-
-        if wp.action == "circle_obstacle":
-            self.process_circle_obstacle_action(wp)
-            return
 
         if self.action_requires_static_hover(wp):
             stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
