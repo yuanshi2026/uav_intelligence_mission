@@ -53,11 +53,12 @@ mission:
     radius: 1.00
     height: 1.35
     circle_speed: 1.00
-    ramp_time: 2.00
+    # 1m/s 绕 1m 半径圆时，向心加速度前馈为 1.00m/s^2。
+    # ramp_time 控制切向加减速，1.50s 比原 2.00s 略激进，但仍避免突然满速。
+    ramp_time: 1.50
     direction: clockwise
-    # 从障碍物下侧切向进入圆：start_angle=90deg，对应半径 1.00m 的圆起点 (4.30, 1.00)。
-    # 这样 QR_SCAN -> OBS_ENTRY -> OBS_CIRCLE_START 不会斜穿障碍物。
-    start_angle_deg: 90.0
+    # 从圆左侧直接入圆/出圆：start_angle=180deg，对应半径 1.00m 的圆起点 (3.30, 0.00)。
+    start_angle_deg: 180.0
     yaw_mode: fixed
     finish_pos_eps: 0.18
     finish_vel_th: 0.25
@@ -96,7 +97,7 @@ mission:
 
   # 通用控制参数
   control:
-    rate_hz: 30.0
+    rate_hz: 50.0
 
     yaw_eps_deg: 5.0
     # 只有快速通过点跳过 YAW_ALIGN 时使用这个更严格的阈值。
@@ -236,44 +237,44 @@ mission:
       acc: 0.48
       hold_time: 0.50
 
-    # 02 顺时针圆形绕障：半径 1.00m，高度 1.35m。
+    # 02 顺时针圆形绕障：半径 1.00m，高度 1.35m，速度 1.00m/s。
     # 障碍物中心为 (4.30, 0.00)，来自比赛地图 (5800,3000) mm 相对起飞点 (1500,3000) mm 的换算。
-    # OBS_ENTRY 先把飞机带到障碍物下侧安全切入区；
+    # 现在删除切向入圆过渡，直接从圆左侧点 (3.30, 0.00) 入圆；
     # OBS_CIRCLE_START 到达圆起点后执行 circle_obstacle 动作，FSM 内部连续发布位置 + 速度 + 加速度前馈；
-    # OBS_EXIT 用于绕圆结束后回到左侧中线通道 (3.40, 0.00)，方便直接飞向第一个图片靶。
+    # OBS_EXIT 也设置在 (3.30, 0.00)，绕完回到圆左侧后再接后续图片靶航点。
     - name: OBS_ENTRY
       kind: route
       control_mode: position
       action: none
-      x: 3.40
-      y: 1.00
+      x: 3.30
+      y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.75
-      acc: 0.70
+      speed: 0.80
+      acc: 0.85
 
     - name: OBS_CIRCLE_START
       kind: scan
       control_mode: fusion
       action: circle_obstacle
-      x: 4.30
-      y: 1.00
+      x: 3.30
+      y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.46
-      acc: 0.45
+      speed: 0.50
+      acc: 0.65
       hold_time: 0.15
 
     - name: OBS_EXIT
       kind: route
       control_mode: position
       action: none
-      x: 3.40
+      x: 3.30
       y: 0.00
       z: 1.35
       yaw_deg: 0.0
-      speed: 0.75
-      acc: 0.70
+      speed: 0.80
+      acc: 0.85
 
     # 03 图片靶真实视觉逻辑：
     # 每个候选图片靶先走 *_OVER 保持原航线，再在同坐标 *_SCAN 做高空分类。
