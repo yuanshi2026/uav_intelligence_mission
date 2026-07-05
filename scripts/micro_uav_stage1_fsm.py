@@ -2821,9 +2821,17 @@ class MicroUAVStage1FSM:
         )
 
         if not debug["finished"]:
+            # 实飞排查用：同时打印实际位置到圆心的半径，判断是目标圆有问题，还是飞机实际跟踪切内圈/外扩。
+            cx_now, cy_now, _ = self.current_xyz()
+            actual_r = math.sqrt(
+                (cx_now - debug["center_x"]) * (cx_now - debug["center_x"]) +
+                (cy_now - debug["center_y"]) * (cy_now - debug["center_y"])
+            )
+            radial_err = actual_r - self.circle_radius
+
             rospy.loginfo_throttle(
                 0.5,
-                "[CIRCLE_OBS] wp=%s t=%.2f/%.2f loop=%d center=(%.2f,%.2f) r=%.2f v=%.2f theta=%.1fdeg theta_dot=%.2f pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) acc=(%.2f,%.2f)",
+                "[CIRCLE_OBS] wp=%s t=%.2f/%.2f loop=%d center=(%.2f,%.2f) r_cmd=%.2f r_actual=%.2f radial_err=%.2f v=%.2f theta=%.1fdeg theta_dot=%.2f pos=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f) acc=(%.2f,%.2f)",
                 wp.name,
                 elapsed,
                 debug["total_time"],
@@ -2831,6 +2839,8 @@ class MicroUAVStage1FSM:
                 debug["center_x"],
                 debug["center_y"],
                 self.circle_radius,
+                actual_r,
+                radial_err,
                 self.circle_speed,
                 math.degrees(debug["theta"]),
                 debug["theta_dot"],
@@ -2990,9 +3000,17 @@ class MicroUAVStage1FSM:
                 self.circle_finish_start_time = None
                 self.circle_finish_stable_start_time = None
 
+        # 圆形绕障是连续轨迹控制，必须保持 setpoint 流干净。
+        # 注意：这里不能像二维码/图片靶/特殊靶动作那样，先发布“当前位置悬停、速度为 0”的 hold setpoint，
+        # 再发布圆轨迹 setpoint。否则飞控会在同一个 ACTION 周期内先收到“停住”，又收到“绕圆”，
+        # 位置/速度/加速度前馈会被静止目标污染，实飞容易出现绕圆半径收缩、跟踪不干净。
+        if wp.action == "circle_obstacle":
+            self.process_circle_obstacle_action(wp)
+            return
+
         hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, tz)
 
-        # ACTION 阶段始终发布当前悬停目标。视觉对准时 action_hold_target 会在原航点附近更新。
+        # 其他 ACTION 阶段才发布当前悬停目标。视觉对准时 action_hold_target 会在原航点附近更新。
         self.publish_position_velocity_yaw(
             hold_tx,
             hold_ty,
@@ -3002,10 +3020,6 @@ class MicroUAVStage1FSM:
             0.0,
             self.locked_yaw
         )
-
-        if wp.action == "circle_obstacle":
-            self.process_circle_obstacle_action(wp)
-            return
 
         if self.action_requires_static_hover(wp):
             stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
