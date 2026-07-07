@@ -361,7 +361,7 @@ mission:
     z: 1.35
     yaw_deg: 0.0
     speed: 1.00
-    acc: 0.85
+    acc: 0.90
 
   - name: IMG3_SCAN
     kind: scan
@@ -537,7 +537,7 @@ mission:
     y: 0.00
     z: 1.35
     yaw_deg: -90.0
-    speed: 0.75
+    speed: 0.85
     acc: 0.35
 
   - name: LAND_FINAL_DYNAMIC
@@ -549,6 +549,6 @@ mission:
     y: 0.00
     z: 1.35
     yaw_deg: -90.0
-    speed: 0.45
+    speed: 0.55
     acc: 0.25
     hold_time: 1.00
