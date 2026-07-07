@@ -42,6 +42,7 @@ import time
 import threading
 import os
 import glob
+import json
 
 import rospy
 from std_msgs.msg import Bool, String
@@ -72,6 +73,21 @@ class UdpUavCmdReceiver:
         # 若设置 _auth_token:=abc123，则电脑端需要发送 CMD:START:abc123
         self.auth_token = str(rospy.get_param("~auth_token", "")).strip()
         self.fsm_heartbeat_timeout = float(rospy.get_param("~fsm_heartbeat_timeout", 2.0))
+
+        # ---------- 视觉结果转发到地面站 ----------
+        # 视觉节点会发布 /uav/vision_result，内容是 JSON 字符串。
+        # 本节点只转发 target=image_target 的结果，方便地面站实时确认图片靶识别是否正确。
+        self.vision_result_topic = str(rospy.get_param("~vision_result_topic", "/uav/vision_result"))
+        self.vision_forward_enabled = bool(rospy.get_param("~vision_forward_enabled", True))
+        self.vision_forward_target = str(rospy.get_param("~vision_forward_target", "image_target")).strip().lower()
+        self.vision_forward_max_hz = float(rospy.get_param("~vision_forward_max_hz", 4.0))
+        # 默认自动使用最近一次给无人机发 UDP 命令的地面站地址。
+        # 如果想固定发给某台电脑，也可以传 _ground_station_ip:=... _ground_station_port:=...
+        self.ground_station_ip = str(rospy.get_param("~ground_station_ip", "")).strip()
+        self.ground_station_port = int(rospy.get_param("~ground_station_port", 0))
+        self.last_client_addr = None
+        self.last_vision_forward_time = 0.0
+        self.last_vision_summary = "NONE"
 
         # ---------- ESP32 串口投放参数 ----------
         self.drop_serial_enabled = bool(rospy.get_param("~drop_serial_enabled", True))
@@ -137,6 +153,9 @@ class UdpUavCmdReceiver:
         # FSM 自动投放命令入口。
         rospy.Subscriber("/uav/drop_cmd", String, self.drop_cmd_cb, queue_size=10)
 
+        # 订阅视觉节点结果，并把图片靶识别结果通过 UDP 推送给地面站。
+        rospy.Subscriber(self.vision_result_topic, String, self.vision_result_cb, queue_size=20)
+
         # ---------- 可选读取 MAVROS 状态 ----------
         self.mavros_connected = "UNKNOWN"
         self.mavros_armed = "UNKNOWN"
@@ -166,6 +185,16 @@ class UdpUavCmdReceiver:
         rospy.logwarn(
             "Supported commands: CMD:PING, CMD:STATUS, CMD:START, CMD:LAND, CMD:STOP, CMD:RESET, CMD:DISARM, "
             "CMD:L1/L2/L3, CMD:R1/R2/R3, CMD:L0/R0"
+        )
+
+        rospy.logwarn(
+            "Vision UDP forward: enabled=%s topic=%s target=%s max_hz=%.1f fixed_gs=%s:%d",
+            str(self.vision_forward_enabled),
+            self.vision_result_topic,
+            self.vision_forward_target,
+            self.vision_forward_max_hz,
+            self.ground_station_ip if self.ground_station_ip else "AUTO_LAST_CLIENT",
+            self.ground_station_port
         )
 
         rospy.logwarn(
@@ -235,6 +264,75 @@ class UdpUavCmdReceiver:
             self.sock.sendto((text + "\n").encode("utf-8"), addr)
         except Exception as e:
             rospy.logwarn("Failed to send UDP reply to %s: %s", str(addr), str(e))
+
+    def get_ground_station_addr(self):
+        """获取视觉结果要推送到的地面站 UDP 地址。"""
+        if self.ground_station_ip and self.ground_station_port > 0:
+            return (self.ground_station_ip, self.ground_station_port)
+        return self.last_client_addr
+
+    def vision_result_cb(self, msg):
+        """订阅 /uav/vision_result，并把图片靶识别结果推送给地面站。
+
+        下行协议：
+            VISION:IMAGE:{json}
+
+        json 中保留视觉节点发布的关键信息，例如 detected、class_name、confidence、
+        reason、stable_count、offset_x_m、offset_y_m、classifier_method 等。
+        """
+        if not self.vision_forward_enabled:
+            return
+
+        try:
+            data = json.loads(msg.data)
+        except Exception as e:
+            rospy.logwarn_throttle(2.0, "vision_result JSON parse failed: %s", str(e))
+            return
+
+        target = str(data.get("target", "")).strip().lower()
+        if target != self.vision_forward_target:
+            return
+
+        if self.vision_forward_max_hz > 0:
+            now = time.time()
+            min_interval = 1.0 / max(0.1, self.vision_forward_max_hz)
+            if now - self.last_vision_forward_time < min_interval:
+                return
+            self.last_vision_forward_time = now
+
+        addr = self.get_ground_station_addr()
+        if addr is None:
+            rospy.logwarn_throttle(3.0, "No ground station UDP address yet. Send CMD:PING/STATUS/START from ground station first.")
+            return
+
+        payload = {
+            "target": target,
+            "detected": bool(data.get("detected", False)),
+            "reason": data.get("reason", ""),
+            "class_name": data.get("class_name", ""),
+            "confidence": float(data.get("confidence", 0.0) or 0.0),
+            "stable_count": int(data.get("stable_count", 0) or 0),
+            "offset_x_m": float(data.get("offset_x_m", 0.0) or 0.0),
+            "offset_y_m": float(data.get("offset_y_m", 0.0) or 0.0),
+            "target_center_px": data.get("target_center_px", []),
+            "offset_px": data.get("offset_px", []),
+            "board_area_px": float(data.get("board_area_px", 0.0) or 0.0),
+            "board_aspect": float(data.get("board_aspect", 0.0) or 0.0),
+            "classifier_method": data.get("classifier_method", data.get("detector_method", "")),
+            "stamp": data.get("stamp", rospy.Time.now().to_sec()),
+        }
+
+        text = "VISION:IMAGE:" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        self.send_reply(text, addr)
+
+        cls = payload.get("class_name") or "none"
+        self.last_vision_summary = "%s detected=%s class=%s conf=%.2f reason=%s" % (
+            target,
+            str(payload.get("detected")),
+            cls,
+            float(payload.get("confidence", 0.0)),
+            str(payload.get("reason", ""))
+        )
 
     def publish_bool_pulse(self, pub, topic_name):
         """
@@ -688,7 +786,8 @@ class UdpUavCmdReceiver:
             "connected=%s;"
             "armed=%s;"
             "mode=%s;"
-            "%s"
+            "%s;"
+            "last_vision=%s"
         ) % (
             self.fsm_state,
             self.safety_state,
@@ -696,7 +795,8 @@ class UdpUavCmdReceiver:
             self.mavros_connected,
             self.mavros_armed,
             self.mavros_mode,
-            self.serial_status_text()
+            self.serial_status_text(),
+            self.last_vision_summary
         )
 
     def build_ping_text(self):
@@ -748,6 +848,9 @@ class UdpUavCmdReceiver:
             rospy.logwarn("UDP command rejected from %s: %s", str(addr), reply)
             self.send_reply(reply, addr)
             return
+
+        # 记录最近一次地面站地址。视觉结果实时推送默认发给这个地址。
+        self.last_client_addr = addr
 
         rospy.logwarn("UDP command received from %s: CMD:%s", str(addr), cmd)
 
