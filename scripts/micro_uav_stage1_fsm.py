@@ -412,6 +412,13 @@ class MicroUAVStage1FSM:
         self.ring_timeout_policy = str(self.action_cfg.get("ring_timeout_policy", "hold")).lower()
         self.ring_pre_distance = float(self.action_cfg.get("ring_pre_distance", 0.65))
         self.ring_post_distance = float(self.action_cfg.get("ring_post_distance", 0.80))
+        # 圆环前视相机安装偏置补偿。
+        # ring_align_bias_x：MAVROS local X 方向补偿，单位 m；正值表示动态穿环点整体向 local +X 偏。
+        # ring_align_bias_z：MAVROS local Z 高度补偿，单位 m；正值表示动态穿环点整体升高。
+        # 用法：如果圆环在相机画面居中时，机体中心实际偏向 -X 侧，就把 bias_x 调成正值；
+        # 如果机体中心实际偏低，就把 bias_z 调成正值。先从 ±0.03~0.05 m 小步调。
+        self.ring_align_bias_x = float(self.action_cfg.get("ring_align_bias_x", 0.0))
+        self.ring_align_bias_z = float(self.action_cfg.get("ring_align_bias_z", 0.0))
         # 穿环后动态横移点：RING_POST 后保持同一 y，再沿 x 方向朝降落区移动一段距离。
         self.ring_exit_x_distance = float(self.action_cfg.get("ring_exit_x_distance", 0.0))
         self.ring_align_timeout = float(self.action_cfg.get("ring_align_timeout", 4.0))
@@ -420,6 +427,13 @@ class MicroUAVStage1FSM:
         self.ring_align_gain = float(self.action_cfg.get("ring_align_gain", 0.75))
         self.ring_min_confidence = float(self.action_cfg.get("ring_min_confidence", 0.70))
         self.ring_min_stable_count = int(self.action_cfg.get("ring_min_stable_count", 3))
+        # 远距离圆环搜索阶段单独增加“最短观察时间”和“更高稳定帧数”。
+        # 这样 RING_SEARCH_START 不会一识别到圆环就立刻生成穿环点，
+        # 可以多看几帧，降低远距离中心点被单帧抖动带偏的概率。
+        self.ring_search_min_time = float(self.action_cfg.get("ring_search_min_time", 0.0))
+        self.ring_search_min_stable_count = int(
+            self.action_cfg.get("ring_search_min_stable_count", self.ring_min_stable_count)
+        )
         self.ring_forward_min = float(self.action_cfg.get("ring_forward_min", 0.30))
         self.ring_forward_max = float(self.action_cfg.get("ring_forward_max", 3.50))
         self.ring_min_z = float(self.action_cfg.get("ring_min_z", 1.35))
@@ -2172,7 +2186,10 @@ class MicroUAVStage1FSM:
             yaw_err = abs(wrap_pi(self.locked_yaw - self.current_yaw))
             can_skip_yaw_align = (
                 wp.action == "none" and
-                wp.control_mode == "fusion_route" and
+                (
+                    wp.control_mode == "fusion_route" or
+                    wp.name.upper() == "RING_POST"
+                ) and
                 yaw_err < self.skip_yaw_align_eps
             )
 
@@ -2774,6 +2791,29 @@ class MicroUAVStage1FSM:
 
         return True, forward_m, offset_y_m, offset_z_m, "ok"
 
+    def get_ring_align_error_local(self, offset_y_m, offset_z_m):
+        """
+        把前视相机看到的圆环左右/高度偏差，换算成本机 local 坐标下的对准误差。
+
+        这里加入 ring_align_bias_x / ring_align_bias_z，用来补偿前视相机识别中心
+        和机体中心不重合的问题。
+        - 未加偏置时：目标是让视觉 offset_y_m=0、offset_z_m=0。
+        - 加偏置后：目标是让“视觉偏差 + 安装偏置补偿”接近 0。
+
+        例如当前任务 yaw≈-90° 时，机体左右方向基本对应 local X：
+        bias_x > 0 会让穿环轨迹整体向 local +X 偏；
+        bias_z > 0 会让穿环轨迹整体升高。
+        """
+        dx_local, dy_local = self.body_xy_to_local_xy(0.0, offset_y_m)
+
+        # X/Z 偏置只修正穿环平面内的横向和高度；
+        # 不额外修正 local Y，避免在 RING_PRE 阶段追前后距离、越调越靠近圆环。
+        err_x = dx_local + self.ring_align_bias_x
+        err_y = dy_local
+        err_z = offset_z_m + self.ring_align_bias_z
+
+        return err_x, err_y, err_z
+
     def build_dynamic_ring_points_from_vision(self, forward_m, offset_y_m, offset_z_m, update_pre=True):
         """
         根据 ring_gate 视觉结果动态生成穿环三点。
@@ -2784,9 +2824,11 @@ class MicroUAVStage1FSM:
         # 当前机体系 forward/left 转 local x/y。
         dx_local, dy_local = self.body_xy_to_local_xy(forward_m, offset_y_m)
 
-        center_x = cx + dx_local
+        # 视觉测到的是“相机识别中心”相对圆环中心的偏差。
+        # 前视相机不一定装在机体中心，因此这里允许用 X/Z 偏置把动态穿环轨迹整体微调。
+        center_x = cx + dx_local + self.ring_align_bias_x
         center_y = cy + dy_local
-        center_z = clamp(cz + offset_z_m, self.ring_min_z, self.ring_max_z)
+        center_z = clamp(cz + offset_z_m + self.ring_align_bias_z, self.ring_min_z, self.ring_max_z)
 
         # 穿越方向按当前锁定 yaw 的机头方向生成，避免视觉轻微抖动影响穿越直线方向。
         pass_yaw = self.locked_yaw
@@ -2819,6 +2861,8 @@ class MicroUAVStage1FSM:
             "forward_m": forward_m,
             "offset_y_m": offset_y_m,
             "offset_z_m": offset_z_m,
+            "ring_align_bias_x": self.ring_align_bias_x,
+            "ring_align_bias_z": self.ring_align_bias_z,
             "center_x": center_x,
             "center_y": center_y,
             "center_z": center_z,
@@ -2848,23 +2892,23 @@ class MicroUAVStage1FSM:
 
     def update_ring_pre_align_target(self, offset_y_m, offset_z_m):
         """
-        RING_PRE 二次对准：只根据左右和高度偏差修正，不追 forward_m，避免靠圆环过近。
+        RING_PRE 二次对准：只根据横向和高度偏差修正，不追 forward_m，避免靠圆环过近。
+        这里使用带 X/Z 安装偏置补偿后的 local 误差。
         """
         cx, cy, cz = self.current_xyz()
-        dx_local, dy_local = self.body_xy_to_local_xy(0.0, offset_y_m)
-        dz_local = offset_z_m
+        err_x, err_y, err_z = self.get_ring_align_error_local(offset_y_m, offset_z_m)
 
-        dx_local, dy_local, dz_local = limit_vector_norm(
-            dx_local,
-            dy_local,
-            dz_local,
+        err_x, err_y, err_z = limit_vector_norm(
+            err_x,
+            err_y,
+            err_z,
             self.ring_align_step_max
         )
 
         self.action_hold_target = [
-            cx + self.ring_align_gain * dx_local,
-            cy + self.ring_align_gain * dy_local,
-            clamp(cz + self.ring_align_gain * dz_local, self.ring_min_z, self.ring_max_z)
+            cx + self.ring_align_gain * err_x,
+            cy + self.ring_align_gain * err_y,
+            clamp(cz + self.ring_align_gain * err_z, self.ring_min_z, self.ring_max_z)
         ]
 
     def get_circle_loop_count(self):
@@ -4484,7 +4528,20 @@ class MicroUAVStage1FSM:
         stable_count = int(data.get("stable_count", 1))
         confidence = float(data.get("confidence", 1.0))
 
-        if stable_count < self.ring_min_stable_count:
+        if elapsed < self.ring_search_min_time:
+            rospy.loginfo_throttle(
+                0.5,
+                "[RING_SEARCH_MIN_TIME_WAIT] forward=%.2f y=%.2f z=%.2f conf=%.2f elapsed=%.1f/%.1f",
+                forward_m,
+                offset_y_m,
+                offset_z_m,
+                confidence,
+                elapsed,
+                self.ring_search_min_time
+            )
+            return
+
+        if stable_count < self.ring_search_min_stable_count:
             rospy.loginfo_throttle(
                 0.5,
                 "[RING_SEARCH_STABLE_WAIT] forward=%.2f y=%.2f z=%.2f conf=%.2f stable=%d/%d",
@@ -4493,7 +4550,7 @@ class MicroUAVStage1FSM:
                 offset_z_m,
                 confidence,
                 stable_count,
-                self.ring_min_stable_count
+                self.ring_search_min_stable_count
             )
             return
 
@@ -4504,7 +4561,7 @@ class MicroUAVStage1FSM:
     def do_ring_pre_align_action(self, wp, tx, ty, tz, elapsed):
         """
         RING_PRE 二次对准：到动态预穿越点后，继续看圆环，修正左右和高度；
-        偏差足够小后，用最新视觉结果更新 RING_CENTER / RING_POST，然后连续穿越。
+        偏差足够小后直接进入穿环，不再用近距离视觉刷新 RING_CENTER / RING_POST。
         """
         self.scan_enable_pub.publish(Bool(data=True))
         self.scan_target_pub.publish(String(data="ring_gate"))
@@ -4538,16 +4595,23 @@ class MicroUAVStage1FSM:
             rospy.logwarn_throttle(0.5, "Invalid ring pre-align vision: %s", reason)
             return
 
-        yz_err = math.sqrt(offset_y_m * offset_y_m + offset_z_m * offset_z_m)
+        err_x, err_y, err_z = self.get_ring_align_error_local(offset_y_m, offset_z_m)
+        align_err = norm3(err_x, err_y, err_z)
 
-        if yz_err > self.ring_yz_eps:
+        if align_err > self.ring_yz_eps:
             self.update_ring_pre_align_target(offset_y_m, offset_z_m)
             rospy.loginfo_throttle(
                 0.5,
-                "[RING_PRE_ALIGN] y=%.3f z=%.3f err=%.3f target=(%.2f, %.2f, %.2f)",
+                "[RING_PRE_ALIGN] raw_y=%.3f raw_z=%.3f bias_x=%.3f bias_z=%.3f "
+                "err_local=(%.3f, %.3f, %.3f) err=%.3f target=(%.2f, %.2f, %.2f)",
                 offset_y_m,
                 offset_z_m,
-                yz_err,
+                self.ring_align_bias_x,
+                self.ring_align_bias_z,
+                err_x,
+                err_y,
+                err_z,
+                align_err,
                 self.action_hold_target[0],
                 self.action_hold_target[1],
                 self.action_hold_target[2]
@@ -4566,25 +4630,34 @@ class MicroUAVStage1FSM:
         )
 
         if ready_to_pass:
-            # 用 RING_PRE 位置的最新视觉结果刷新 CENTER/POST；PRE 不再重写，避免来回跳。
-            self.build_dynamic_ring_points_from_vision(forward_m, offset_y_m, offset_z_m, update_pre=False)
+            # 只把 RING_PRE 当作二次确认点，不再用近距离视觉刷新 CENTER/POST/EXIT_X。
+            # 原因：RING_PRE 离圆环更近，前视画面更容易出现圆环截断、识别框变形，
+            # 若此时重新估算圆环中心，可能把已经在远距离锁定好的穿环线重新拉偏或拉近。
+            # 因此穿环中心和后方余量沿用 RING_SEARCH_START 远距离生成的动态点；
+            # 视觉失败时则沿用 YAML 固定兜底点。
             self.disable_scan_request()
             rospy.loginfo(
-                "Ring pre-align ready: forward=%.2f y=%.3f z=%.3f err=%.3f. Start passing gate.",
+                "Ring pre-align ready: forward=%.2f raw_y=%.3f raw_z=%.3f "
+                "bias_x=%.3f bias_z=%.3f err=%.3f. "
+                "Start passing gate without refreshing CENTER/POST from near vision.",
                 forward_m,
                 offset_y_m,
                 offset_z_m,
-                yz_err
+                self.ring_align_bias_x,
+                self.ring_align_bias_z,
+                align_err
             )
             self.next_waypoint()
             return
 
         rospy.loginfo_throttle(
             0.5,
-            "[RING_PRE_READY_WAIT] y=%.3f z=%.3f err=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
+            "[RING_PRE_READY_WAIT] raw_y=%.3f raw_z=%.3f bias_x=%.3f bias_z=%.3f err=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
             offset_y_m,
             offset_z_m,
-            yz_err,
+            self.ring_align_bias_x,
+            self.ring_align_bias_z,
+            align_err,
             confidence,
             stable_count,
             self.ring_min_stable_count,
