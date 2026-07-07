@@ -46,7 +46,7 @@ mission:
   # 这里采用位置 + 速度前馈 + 加速度前馈连续发布的圆形轨迹。
   obstacle:
     mode: circle_feedforward
-    loop_count: 3
+    loop_count: 5
     max_loop_count: 8
     center_x: 4.30
     center_y: 0.00
@@ -219,8 +219,8 @@ mission:
     # 搜索失败时按 ring_timeout_policy 决定是否走 YAML 固定兜底点。
     ring_search_timeout: 5.0
     ring_timeout_policy: fixed  # fixed：圆环视觉超时后继续走 YAML 固定穿环点，保证任务不断线
-    ring_pre_distance: 0.65
-    ring_post_distance: 0.5
+    ring_pre_distance: 1.00
+    ring_post_distance: 0.60
     ring_align_timeout: 4.0
     ring_yz_eps: 0.07
     ring_align_step_max: 0.12
@@ -257,7 +257,7 @@ mission:
     y: 0.00
     z: 1.35
     yaw_deg: 0.0
-    speed: 0.46
+    speed: 0.80
     acc: 0.48
     hold_time: 0.50
 
@@ -314,7 +314,7 @@ mission:
     z: 1.35
     yaw_deg: 0.0
     speed: 0.90
-    acc: 0.85
+    acc: 0.95
 
   - name: IMG2_SCAN
     kind: scan
@@ -497,7 +497,7 @@ mission:
     control_mode: fusion
     action: ring_search
     x: 6.00
-    y: -0.75
+    y: -0.25
     z: 1.40
     yaw_deg: -90.0
     speed: 0.58
@@ -509,7 +509,7 @@ mission:
     control_mode: fusion
     action: ring_pre_align
     x: 6.00
-    y: -1.00
+    y: -0.60
     z: 1.40
     yaw_deg: -90.0
     speed: 0.52
@@ -532,7 +532,7 @@ mission:
     control_mode: fusion_route
     action: none
     x: 6.00
-    y: -2.10
+    y: -2.20
     z: 1.40
     yaw_deg: -90.0
     speed: 1.00
@@ -543,7 +543,7 @@ mission:
     control_mode: position
     action: none
     x: 4.0
-    y: -2.1
+    y: -2.20
     z: 1.4
     yaw_deg: -90.0
     speed: 0.75
