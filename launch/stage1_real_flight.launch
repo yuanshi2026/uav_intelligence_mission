@@ -99,14 +99,6 @@
         <!-- Default mount assumption: image top is UAV forward, image left is UAV left. -->
         <param name="body_forward_from_image_down" value="-1.0" />
         <param name="body_left_from_image_right" value="-1.0" />
-
-        <!-- Front RealSense ring calibration. Camera offsets are relative to the UAV body/local-position center. -->
-        <param name="ring_outer_diameter_m" value="1.20" />
-        <param name="ring_left_from_camera_right" value="-1.0" />
-        <param name="ring_up_from_camera_down" value="-1.0" />
-        <param name="ring_camera_forward_offset_m" value="0.0" />
-        <param name="ring_camera_left_offset_m" value="0.0" />
-        <param name="ring_camera_up_offset_m" value="0.0" />
     </node>
 
     <!-- UDP bridge for simple ground station commands -->
