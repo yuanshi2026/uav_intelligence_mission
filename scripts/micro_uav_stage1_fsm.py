@@ -340,6 +340,31 @@ class MicroUAVStage1FSM:
         self.align_min_confidence = float(self.action_cfg.get("align_min_confidence", 0.75))
         self.align_min_stable_count = int(self.action_cfg.get("align_min_stable_count", 3))
 
+        # ---------- 图片靶“高空扫描顺便瞄准 + 锁定 XY + 低空投放”参数 ----------
+        # 思路：图片靶先在较高高度识别类别，同时利用外圈/靶心偏差修正 XY；
+        # 一旦类别匹配或触发剩余数量兜底，就锁定此时的 XY，随后只降高，不再回到 YAML 原始点。
+        # 低空如果因为相机太近看不全圆环，可在锁定 XY 附近短时等待后兜底投放。
+        self.image_scan_aim_enabled = bool(self.action_cfg.get("image_scan_aim_enabled", True))
+        self.image_scan_aim_xy_eps = float(self.action_cfg.get("image_scan_aim_xy_eps", 0.08))
+        self.image_scan_aim_min_confidence = float(
+            self.action_cfg.get("image_scan_aim_min_confidence", self.image_class_min_confidence)
+        )
+        self.image_scan_aim_max_wait = float(self.action_cfg.get("image_scan_aim_max_wait", 1.20))
+        self.image_scan_aim_required_for_drop = bool(
+            self.action_cfg.get("image_scan_aim_required_for_drop", True)
+        )
+        self.image_scan_aim_max_shift = float(self.action_cfg.get("image_scan_aim_max_shift", 0.30))
+        self.image_lock_xy_on_descend = bool(self.action_cfg.get("image_lock_xy_on_descend", True))
+        self.image_low_align_max_shift = float(self.action_cfg.get("image_low_align_max_shift", 0.16))
+        self.image_low_no_vision_force_drop = bool(
+            self.action_cfg.get("image_low_no_vision_force_drop", True)
+        )
+        self.image_low_no_vision_force_wait = float(
+            self.action_cfg.get("image_low_no_vision_force_wait", 0.70)
+        )
+        self.image_low_force_pos_eps = float(self.action_cfg.get("image_low_force_pos_eps", 0.18))
+        self.image_low_force_vel = float(self.action_cfg.get("image_low_force_vel", 0.20))
+
         # 特殊靶专用参数：特殊靶只做靶心瞄准，不做类别识别。
         # 这里单独放宽特殊靶条件，避免影响图片靶分类/投放逻辑。
         self.special_align_xy_eps = float(
@@ -482,6 +507,9 @@ class MicroUAVStage1FSM:
         self.image_phase_start_time = None
         self.pending_drop_cmd = ""
         self.pending_image_class = ""
+        # 图片靶高空瞄准锁定点。进入 DESCEND 前写入，DESCEND/ALIGN_DROP 都围绕它工作。
+        self.image_locked_xy = None
+        self.image_locked_xy_reason = ""
 
         # ---------- 图片靶 / 特殊靶视觉闭环缓存 ----------
         # vision_results[target] 保存 /uav/vision_result 的最近一次 JSON 结果。
@@ -1171,6 +1199,8 @@ class MicroUAVStage1FSM:
         self.image_phase_start_time = None
         self.pending_drop_cmd = ""
         self.pending_image_class = ""
+        self.image_locked_xy = None
+        self.image_locked_xy_reason = ""
 
     def mission_z_to_abs(self, z):
         """把任务 YAML 中的高度 z 转成 MAVROS local 绝对高度。"""
@@ -1293,24 +1323,60 @@ class MicroUAVStage1FSM:
 
         return True, drop_cmd, remaining_scans, remaining_drops
 
+    def lock_current_image_xy(self, tx, ty, reason):
+        """锁定当前图片靶 ACTION 的 XY 目标点，后续下降/投放不再回到 YAML 原始 XY。"""
+        if self.action_hold_target is not None:
+            lock_x = float(self.action_hold_target[0])
+            lock_y = float(self.action_hold_target[1])
+        else:
+            lock_x = float(tx)
+            lock_y = float(ty)
+
+        self.image_locked_xy = [lock_x, lock_y]
+        self.image_locked_xy_reason = str(reason)
+
+        rospy.loginfo(
+            "[IMAGE_LOCK_XY] xy=(%.3f, %.3f) reason=%s",
+            lock_x,
+            lock_y,
+            self.image_locked_xy_reason
+        )
+
+        return lock_x, lock_y
+
+    def get_image_locked_xy_or_default(self, tx, ty):
+        """读取图片靶已锁定 XY；若未锁定，则回退到当前航点 XY。"""
+        if self.image_lock_xy_on_descend and self.image_locked_xy is not None:
+            return float(self.image_locked_xy[0]), float(self.image_locked_xy[1])
+
+        return float(tx), float(ty)
+
     def start_image_descend_for_drop(self, wp, tx, ty, drop_abs_z, drop_cmd, img_class, reason):
         """
         统一进入图片靶下降投放流程。
         不管是“分类匹配”还是“剩余数量兜底”，后续都走同一套下降、视觉对准、投放逻辑。
+        本版会先锁定高空扫描/瞄准得到的 XY，然后只降低高度到 image_drop_z。
         """
+        if self.image_lock_xy_on_descend and self.image_locked_xy is None:
+            lock_x, lock_y = self.lock_current_image_xy(tx, ty, reason)
+        else:
+            lock_x, lock_y = self.get_image_locked_xy_or_default(tx, ty)
+
         self.pending_drop_cmd = drop_cmd
         self.pending_image_class = img_class
         self.image_action_phase = "DESCEND"
         self.image_phase_start_time = rospy.Time.now()
-        self.action_hold_target = [tx, ty, drop_abs_z]
+        self.action_hold_target = [lock_x, lock_y, drop_abs_z]
         self.vision_results.pop("image_target", None)
 
         rospy.loginfo(
-            "[IMAGE_START_DESCEND] wp=%s class=%s cmd=%s reason=%s descend_to_z=%.2f",
+            "[IMAGE_START_DESCEND] wp=%s class=%s cmd=%s reason=%s locked_xy=(%.3f, %.3f) descend_to_z=%.2f",
             wp.name,
             img_class,
             drop_cmd,
             reason,
+            lock_x,
+            lock_y,
             self.image_drop_z
         )
 
@@ -2536,6 +2602,123 @@ class MicroUAVStage1FSM:
 
         self.action_hold_target = [cand_x, cand_y, target_z]
 
+    def update_action_hold_target_by_vision_limited(self, base_x, base_y, target_z, offset_x_m, offset_y_m, max_shift):
+        """
+        通用限幅视觉微调：围绕 base_x/base_y 更新 ACTION 悬停点，并限制最大偏移。
+        用于高空扫描锁定和低空锁点附近微调，避免视觉尺度错误把飞机拉离靶心。
+        """
+        cx, cy, _ = self.current_xyz()
+        dx_local, dy_local = self.body_xy_to_local_xy(offset_x_m, offset_y_m)
+
+        dx_local, dy_local, _ = limit_vector_norm(
+            dx_local,
+            dy_local,
+            0.0,
+            self.align_step_max
+        )
+
+        cand_x = cx + self.align_gain * dx_local
+        cand_y = cy + self.align_gain * dy_local
+
+        rel_x = cand_x - base_x
+        rel_y = cand_y - base_y
+        rel_norm = math.sqrt(rel_x * rel_x + rel_y * rel_y)
+        max_shift = max(0.0, float(max_shift))
+
+        if max_shift > 1e-6 and rel_norm > max_shift:
+            scale = max_shift / rel_norm
+            cand_x = base_x + rel_x * scale
+            cand_y = base_y + rel_y * scale
+
+        self.action_hold_target = [cand_x, cand_y, target_z]
+
+    def update_image_scan_aim_from_vision(self, wp, tx, ty, tz, data):
+        """
+        高空分类扫描阶段顺便瞄准图片靶。
+        返回：(aim_ready, offset_norm, reason)。aim_ready=True 表示 XY 偏差已经足够小，或未启用高空瞄准。
+        """
+        if not self.image_scan_aim_enabled:
+            return True, 0.0, "disabled"
+
+        if data is None:
+            return False, 999.0, "no_vision"
+
+        ok_offset, offset_x, offset_y = self.get_vision_offset_xy(data)
+        if not ok_offset:
+            return False, 999.0, "bad_offset"
+
+        offset_norm = math.sqrt(offset_x * offset_x + offset_y * offset_y)
+
+        if offset_norm > self.image_scan_aim_xy_eps:
+            # 高空阶段围绕 YAML 靶心点限幅修正，逐步把下视相机中心移到图片靶圆心附近。
+            self.update_action_hold_target_by_vision_limited(
+                tx,
+                ty,
+                tz,
+                offset_x,
+                offset_y,
+                self.image_scan_aim_max_shift
+            )
+            rospy.loginfo_throttle(
+                0.4,
+                "[IMAGE_SCAN_AIM] wp=%s offset=(%.3f, %.3f) norm=%.3f/%.3f target=(%.2f, %.2f, %.2f)",
+                wp.name,
+                offset_x,
+                offset_y,
+                offset_norm,
+                self.image_scan_aim_xy_eps,
+                self.action_hold_target[0],
+                self.action_hold_target[1],
+                self.action_hold_target[2]
+            )
+            return False, offset_norm, "aiming"
+
+        return True, offset_norm, "aim_ready"
+
+    def image_locked_force_drop_ready(self, wp, tx, ty, drop_abs_z, reason):
+        """
+        图片靶低空视觉丢失兜底：如果已锁定 XY，且飞机已稳定在锁点附近，则直接投放。
+        用于解决低空相机离地太近，看不全图片靶圆环导致无法继续识别的问题。
+        """
+        lock_x, lock_y = self.get_image_locked_xy_or_default(tx, ty)
+        hold_tx, hold_ty, hold_tz = self.get_action_hold_target(lock_x, lock_y, drop_abs_z)
+        cx, cy, cz = self.current_xyz()
+        pos_err = norm3(hold_tx - cx, hold_ty - cy, hold_tz - cz)
+
+        ready = (
+            pos_err < self.image_low_force_pos_eps and
+            self.current_speed < self.image_low_force_vel and
+            self.pending_drop_cmd != ""
+        )
+
+        if ready:
+            rospy.logwarn(
+                "[IMAGE_LOCKED_FORCE_DROP] wp=%s cmd=%s reason=%s locked_xy=(%.3f, %.3f) pos_err=%.3f vel=%.3f",
+                wp.name,
+                self.pending_drop_cmd,
+                reason,
+                lock_x,
+                lock_y,
+                pos_err,
+                self.current_speed
+            )
+            if self.send_drop_once(self.pending_drop_cmd):
+                self.mark_image_drop_done(self.pending_drop_cmd)
+            self.image_action_phase = "DROP_WAIT"
+            return True
+
+        rospy.loginfo_throttle(
+            0.5,
+            "[IMAGE_LOCKED_FORCE_WAIT] wp=%s reason=%s pos_err=%.3f/%.3f vel=%.3f/%.3f",
+            wp.name,
+            reason,
+            pos_err,
+            self.image_low_force_pos_eps,
+            self.current_speed,
+            self.image_low_force_vel
+        )
+        return False
+
 
     def get_ring_vision_offset(self, data):
         """
@@ -3195,11 +3378,10 @@ class MicroUAVStage1FSM:
 
     def do_image_scan_maybe_drop_action(self, wp, tx, ty, tz, elapsed):
         """
-        图片靶正式视觉两阶段逻辑：
-        1. 在 IMGx_SCAN 的 1.35m 高度识别类别；
-        2. 类别匹配二维码目标后，下降到 image_drop_z；
-        3. 低空使用 offset_x_m / offset_y_m 对准；
-        4. 对准后投放；若低空对准超时，默认 force_drop 尽量拿分。
+        图片靶正式视觉三阶段逻辑：
+        1. CLASS_SCAN：在高空识别类别，同时用 offset_x_m / offset_y_m 做 XY 瞄准；
+        2. LOCK + DESCEND：类别匹配或剩余数量兜底时，锁定高空瞄准后的 XY，只降低高度到 image_drop_z；
+        3. ALIGN_DROP：低空只在锁定 XY 附近做小范围微调；若低空看不全圆环/视觉丢失，则按锁定 XY 兜底投放。
         """
         self.scan_enable_pub.publish(Bool(data=True))
         self.scan_target_pub.publish(String(data="image_target"))
@@ -3261,21 +3443,78 @@ class MicroUAVStage1FSM:
             return
 
         if self.image_action_phase == "CLASS_SCAN":
-            # 高空分类阶段固定在 YAML 的 IMGx_SCAN 高度，不做 x/y 视觉对准。
-            self.action_hold_target = [tx, ty, tz]
+            # 高空阶段不再死锁 YAML 原始点：默认从 YAML 点开始，随后视觉偏差会逐步修正 XY。
+            if self.action_hold_target is None:
+                self.action_hold_target = [tx, ty, tz]
+            else:
+                self.action_hold_target[2] = tz
 
-            # 新增兜底逻辑：如果剩余图片靶扫描点数量已经等于剩余图片靶投放数量，
-            # 当前图片靶就不再继续赌分类结果，直接下降到低空，走视觉对准后投放。
-            # 例如还剩 2 个 IMG*_SCAN，同时还有 2 个二维码目标没投，
-            # 那么后面两个图片靶必须都尝试投放，否则很容易因为分类超时丢分。
+            # 当前是否触发“剩余扫描点数量 == 剩余待投物块数量”的兜底投放。
             force_drop, force_drop_cmd, remaining_scans, remaining_drops = (
                 self.should_force_image_drop_by_remaining_count()
             )
+
+            # 读取一次视觉结果。这个结果同时服务于：高空瞄准、类别判断、剩余兜底时的 XY 锁定。
+            data, reason = self.get_latest_vision_result(
+                "image_target",
+                min_confidence=self.image_scan_aim_min_confidence
+            )
+
+            aim_ready = True
+            aim_norm = 0.0
+            aim_reason = "disabled"
+
+            if self.image_scan_aim_enabled:
+                if data is None:
+                    aim_ready = False
+                    aim_norm = 999.0
+                    aim_reason = reason
+                else:
+                    aim_ready, aim_norm, aim_reason = self.update_image_scan_aim_from_vision(
+                        wp,
+                        tx,
+                        ty,
+                        tz,
+                        data
+                    )
+
+            # 剩余数量兜底：以前会一进入最后几个图片靶就直接下降。
+            # 现在先尝试在高空完成一次 XY 瞄准；瞄准完成或超过 image_scan_aim_max_wait 后，再锁定 XY 下降。
             if force_drop:
+                if (
+                    self.image_scan_aim_required_for_drop and
+                    not aim_ready and
+                    phase_elapsed < self.image_scan_aim_max_wait
+                ):
+                    rospy.loginfo_throttle(
+                        0.5,
+                        "[IMAGE_REMAINING_EQUAL_AIM_WAIT] wp=%s remaining_scans=%d remaining_drops=%d reason=%s aim_norm=%.3f elapsed=%.2f/%.2f",
+                        wp.name,
+                        remaining_scans,
+                        remaining_drops,
+                        aim_reason,
+                        aim_norm,
+                        phase_elapsed,
+                        self.image_scan_aim_max_wait
+                    )
+                    return
+
+                if not aim_ready:
+                    rospy.logwarn(
+                        "[IMAGE_REMAINING_EQUAL_AIM_TIMEOUT] wp=%s reason=%s aim_norm=%.3f elapsed=%.2f, lock current XY and descend.",
+                        wp.name,
+                        aim_reason,
+                        aim_norm,
+                        phase_elapsed
+                    )
+
                 img_class = self.current_image_class.strip().lower()
+                if data is not None:
+                    img_class = str(data.get("class_name", img_class)).strip().lower()
                 if img_class == "":
                     img_class = "remaining_equal_unknown"
 
+                self.lock_current_image_xy(tx, ty, "remaining_equal_%s" % aim_reason)
                 rospy.logwarn(
                     "[IMAGE_REMAINING_EQUAL_FORCE] wp=%s remaining_scans=%d remaining_drops=%d cmd=%s",
                     wp.name,
@@ -3294,11 +3533,7 @@ class MicroUAVStage1FSM:
                 )
                 return
 
-            data, reason = self.get_latest_vision_result(
-                "image_target",
-                min_confidence=self.image_class_min_confidence
-            )
-
+            # 未触发兜底时，必须拿到类别结果才决定是否下降或跳过。
             if data is None:
                 if phase_elapsed > self.image_class_timeout:
                     rospy.logwarn(
@@ -3396,6 +3631,37 @@ class MicroUAVStage1FSM:
                 )
                 return
 
+            # 类别匹配后，先保证高空瞄准已经基本完成；若超时则锁定当前已修正过的 XY。
+            if (
+                self.image_scan_aim_required_for_drop and
+                not aim_ready and
+                phase_elapsed < self.image_scan_aim_max_wait
+            ):
+                rospy.loginfo_throttle(
+                    0.5,
+                    "[IMAGE_CLASS_MATCH_AIM_WAIT] wp=%s class=%s cmd=%s reason=%s aim_norm=%.3f elapsed=%.2f/%.2f",
+                    wp.name,
+                    img_class,
+                    drop_cmd,
+                    aim_reason,
+                    aim_norm,
+                    phase_elapsed,
+                    self.image_scan_aim_max_wait
+                )
+                return
+
+            if not aim_ready:
+                rospy.logwarn(
+                    "[IMAGE_CLASS_MATCH_AIM_TIMEOUT] wp=%s class=%s cmd=%s reason=%s aim_norm=%.3f elapsed=%.2f, lock current XY and descend.",
+                    wp.name,
+                    img_class,
+                    drop_cmd,
+                    aim_reason,
+                    aim_norm,
+                    phase_elapsed
+                )
+
+            self.lock_current_image_xy(tx, ty, "class_match_%s" % aim_reason)
             self.start_image_descend_for_drop(
                 wp,
                 tx,
@@ -3408,9 +3674,10 @@ class MicroUAVStage1FSM:
             return
 
         if self.image_action_phase == "DESCEND":
-            self.action_hold_target = [tx, ty, drop_abs_z]
+            lock_x, lock_y = self.get_image_locked_xy_or_default(tx, ty)
+            self.action_hold_target = [lock_x, lock_y, drop_abs_z]
             cx, cy, cz = self.current_xyz()
-            pos_err = norm3(tx - cx, ty - cy, drop_abs_z - cz)
+            pos_err = norm3(lock_x - cx, lock_y - cy, drop_abs_z - cz)
             z_err = abs(drop_abs_z - cz)
             descend_ready = (
                 z_err < self.image_descend_pos_eps and
@@ -3421,18 +3688,22 @@ class MicroUAVStage1FSM:
             if descend_ready or phase_elapsed > self.image_descend_timeout:
                 if not descend_ready:
                     rospy.logwarn(
-                        "[IMAGE_DESCEND_TIMEOUT] wp=%s cmd=%s pos_err=%.2f z_err=%.2f speed=%.2f, continue align.",
+                        "[IMAGE_DESCEND_TIMEOUT] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f, continue align/drop.",
                         wp.name,
                         self.pending_drop_cmd,
+                        lock_x,
+                        lock_y,
                         pos_err,
                         z_err,
                         self.current_speed
                     )
                 else:
                     rospy.loginfo(
-                        "[IMAGE_DESCEND_DONE] wp=%s cmd=%s pos_err=%.2f z_err=%.2f",
+                        "[IMAGE_DESCEND_DONE] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f",
                         wp.name,
                         self.pending_drop_cmd,
+                        lock_x,
+                        lock_y,
                         pos_err,
                         z_err
                     )
@@ -3444,9 +3715,11 @@ class MicroUAVStage1FSM:
 
             rospy.loginfo_throttle(
                 0.4,
-                "[IMAGE_DESCEND] wp=%s cmd=%s pos_err=%.2f z_err=%.2f speed=%.2f elapsed=%.2f/%.2f",
+                "[IMAGE_DESCEND] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f elapsed=%.2f/%.2f",
                 wp.name,
                 self.pending_drop_cmd,
+                lock_x,
+                lock_y,
                 pos_err,
                 z_err,
                 self.current_speed,
@@ -3483,19 +3756,42 @@ class MicroUAVStage1FSM:
 
             data, reason = self.get_latest_vision_result("image_target")
             if data is None:
+                if (
+                    self.image_low_no_vision_force_drop and
+                    self.image_locked_xy is not None and
+                    phase_elapsed > self.image_low_no_vision_force_wait
+                ):
+                    if self.image_locked_force_drop_ready(
+                        wp,
+                        tx,
+                        ty,
+                        drop_abs_z,
+                        "low_no_vision_%s" % reason
+                    ):
+                        return
+
                 rospy.loginfo_throttle(
                     0.5,
-                    "[IMAGE_ALIGN_WAIT_VISION] wp=%s cmd=%s reason=%s elapsed=%.2f/%.2f",
+                    "[IMAGE_ALIGN_WAIT_VISION] wp=%s cmd=%s reason=%s elapsed=%.2f/%.2f locked_xy=%s",
                     wp.name,
                     self.pending_drop_cmd,
                     reason,
                     phase_elapsed,
-                    self.image_align_timeout
+                    self.image_align_timeout,
+                    str(self.image_locked_xy)
                 )
                 return
 
             ok_offset, offset_x, offset_y = self.get_vision_offset_xy(data)
             if not ok_offset:
+                if (
+                    self.image_low_no_vision_force_drop and
+                    self.image_locked_xy is not None and
+                    phase_elapsed > self.image_low_no_vision_force_wait
+                ):
+                    if self.image_locked_force_drop_ready(wp, tx, ty, drop_abs_z, "low_bad_offset"):
+                        return
+
                 rospy.logwarn_throttle(
                     0.5,
                     "[IMAGE_ALIGN_BAD_OFFSET] wp=%s cmd=%s",
@@ -3507,10 +3803,18 @@ class MicroUAVStage1FSM:
             offset_norm = math.sqrt(offset_x * offset_x + offset_y * offset_y)
 
             if offset_norm > self.align_xy_eps:
-                self.update_action_hold_target_by_vision(drop_abs_z, offset_x, offset_y)
+                base_x, base_y = self.get_image_locked_xy_or_default(tx, ty)
+                self.update_action_hold_target_by_vision_limited(
+                    base_x,
+                    base_y,
+                    drop_abs_z,
+                    offset_x,
+                    offset_y,
+                    self.image_low_align_max_shift
+                )
                 rospy.loginfo_throttle(
                     0.4,
-                    "[IMAGE_ALIGN] wp=%s class=%s cmd=%s offset=(%.3f, %.3f) norm=%.3f target=(%.2f, %.2f, %.2f)",
+                    "[IMAGE_ALIGN] wp=%s class=%s cmd=%s offset=(%.3f, %.3f) norm=%.3f target=(%.2f, %.2f, %.2f) base_xy=(%.2f, %.2f)",
                     wp.name,
                     self.pending_image_class,
                     self.pending_drop_cmd,
@@ -3519,13 +3823,24 @@ class MicroUAVStage1FSM:
                     offset_norm,
                     self.action_hold_target[0],
                     self.action_hold_target[1],
-                    self.action_hold_target[2]
+                    self.action_hold_target[2],
+                    base_x,
+                    base_y
                 )
+
+                # 低空有偏差但因为相机太近一直无法稳定时，超过短等待也可按锁定 XY 兜底。
+                if (
+                    self.image_low_no_vision_force_drop and
+                    self.image_locked_xy is not None and
+                    phase_elapsed > self.image_low_no_vision_force_wait
+                ):
+                    self.image_locked_force_drop_ready(wp, tx, ty, drop_abs_z, "low_align_slow")
                 return
 
             stable_count = int(data.get("stable_count", 1))
             confidence = float(data.get("confidence", 1.0))
-            hold_tx, hold_ty, hold_tz = self.get_action_hold_target(tx, ty, drop_abs_z)
+            lock_x, lock_y = self.get_image_locked_xy_or_default(tx, ty)
+            hold_tx, hold_ty, hold_tz = self.get_action_hold_target(lock_x, lock_y, drop_abs_z)
             hold_stable, pos_err = self.check_action_static_stable(hold_tx, hold_ty, hold_tz)
 
             ready_to_drop = (
@@ -3539,20 +3854,30 @@ class MicroUAVStage1FSM:
                     self.mark_image_drop_done(self.pending_drop_cmd)
                 self.image_action_phase = "DROP_WAIT"
                 rospy.loginfo(
-                    "[IMAGE_ALIGNED_DROP] wp=%s class=%s cmd=%s offset=%.3f conf=%.2f stable=%d pos_err=%.3f",
+                    "[IMAGE_ALIGNED_DROP] wp=%s class=%s cmd=%s offset=%.3f conf=%.2f stable=%d pos_err=%.3f locked_xy=(%.3f, %.3f)",
                     wp.name,
                     self.pending_image_class,
                     self.pending_drop_cmd,
                     offset_norm,
                     confidence,
                     stable_count,
-                    pos_err
+                    pos_err,
+                    lock_x,
+                    lock_y
                 )
                 return
 
+            if (
+                self.image_low_no_vision_force_drop and
+                self.image_locked_xy is not None and
+                phase_elapsed > self.image_low_no_vision_force_wait
+            ):
+                if self.image_locked_force_drop_ready(wp, tx, ty, drop_abs_z, "low_ready_wait_timeout"):
+                    return
+
             rospy.loginfo_throttle(
                 0.5,
-                "[IMAGE_READY_WAIT] wp=%s class=%s cmd=%s offset=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s",
+                "[IMAGE_READY_WAIT] wp=%s class=%s cmd=%s offset=%.3f conf=%.2f stable=%d/%d pos_err=%.3f hold_stable=%s locked_xy=(%.3f, %.3f)",
                 wp.name,
                 self.pending_image_class,
                 self.pending_drop_cmd,
@@ -3561,7 +3886,9 @@ class MicroUAVStage1FSM:
                 stable_count,
                 self.align_min_stable_count,
                 pos_err,
-                str(hold_stable)
+                str(hold_stable),
+                lock_x,
+                lock_y
             )
             return
 
