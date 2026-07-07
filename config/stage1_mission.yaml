@@ -152,10 +152,10 @@ mission:
     # 图片靶真实视觉两阶段：先在 1.35m 分类，匹配二维码才下降到 image_drop_z 对准投放。
     # image_class_timeout 是高空等待类别的最大时间；保留 image_class_scan_time 作为旧参数兼容别名。
     # 高空现在不仅做分类，还会顺便瞄准并锁定 XY，因此给它稍微多一点时间。
-    image_class_timeout: 1.20
-    image_class_scan_time: 1.20
+    image_class_timeout: 1.50
+    image_class_scan_time: 1.50
     image_class_min_confidence: 0.55
-    image_class_min_stable_count: 1
+    image_class_min_stable_count: 3
     # 图片靶投放高度：先在 1.35m 高空识别/瞄准，锁定 XY 后再降到这里投放。
     # 0.65m 比原 0.70m 更利于落点，但实飞前建议先从 0.70 -> 0.65 分两次试。
     image_drop_z: 0.65
@@ -167,7 +167,7 @@ mission:
     image_scan_aim_enabled: true
     image_scan_aim_xy_eps: 0.08
     image_scan_aim_min_confidence: 0.55
-    image_scan_aim_max_wait: 1.20
+    image_scan_aim_max_wait: 1.50
     image_scan_aim_required_for_drop: true
     image_scan_aim_max_shift: 0.30
     image_lock_xy_on_descend: true
@@ -195,13 +195,13 @@ mission:
     # 图片靶 / 特殊靶视觉闭环对准参数
     # 视觉节点负责像素 -> 米制偏差；FSM 只使用 offset_x_m / offset_y_m 做小范围移动。
     vision_result_timeout: 0.50
-    image_align_timeout: 4.0
+    image_align_timeout: 2.50
     special_align_timeout: 2.50
-    align_xy_eps: 0.05
+    align_xy_eps: 0.08
     align_step_max: 0.15
     align_gain: 0.80
-    align_min_confidence: 0.75
-    align_min_stable_count: 3
+    align_min_confidence: 0.55
+    align_min_stable_count: 1
 
     # 特殊靶专用瞄准/兜底投放参数。
     # 特殊靶不需要类别识别，只需要识别靶心偏差用于瞄准；若瞄准超时，则在已到达低空投放点且速度较低时强制投放一次。
@@ -326,7 +326,7 @@ mission:
     yaw_deg: 0.0
     speed: 0.48
     acc: 0.42
-    hold_time: 0.15
+    hold_time: 0.40
 
   - name: IMG2_UP
     kind: route
@@ -360,7 +360,7 @@ mission:
     yaw_deg: 0.0
     speed: 0.48
     acc: 0.42
-    hold_time: 0.15
+    hold_time: 0.40
 
   - name: IMG1_UP
     kind: route
@@ -394,7 +394,7 @@ mission:
     yaw_deg: 0.0
     speed: 0.48
     acc: 0.42
-    hold_time: 0.15
+    hold_time: 0.40
 
   - name: IMG3_UP
     kind: route
@@ -428,7 +428,7 @@ mission:
     yaw_deg: 0.0
     speed: 0.48
     acc: 0.42
-    hold_time: 0.15
+    hold_time: 0.40
   - name: IMG4_UP
     kind: route
     control_mode: fusion_route

@@ -2285,7 +2285,27 @@ class MicroUAVStage1FSM:
                 self.current_speed < self.brake_soft_vel
             )
 
-            if stable_ready or soft_route_ready:
+            # 对 scan/drop/ring 等带动作的点，不能只因为某一帧满足位置/速度阈值就开始 HOLD/ACTION。
+            # 否则视觉刚进画面、机体还在轻微漂移时，image_class_timeout 等计时就已经开始了。
+            # 这里要求连续稳定 scan_stable_time 秒后，才进入 HOLD，再由 hold_time 进入 ACTION。
+            stable_duration = 0.0
+            stable_enough_for_action = False
+
+            if stable_ready:
+                if self.stable_start_time is None:
+                    self.stable_start_time = rospy.Time.now()
+
+                stable_duration = (rospy.Time.now() - self.stable_start_time).to_sec()
+
+                if wp.action == "none":
+                    # 普通无动作航点仍然保持原来的快速通过/到点逻辑，不额外等 scan_stable_time。
+                    stable_enough_for_action = True
+                else:
+                    stable_enough_for_action = stable_duration >= self.scan_stable_time
+            else:
+                self.stable_start_time = None
+
+            if stable_enough_for_action or soft_route_ready:
                 if soft_route_ready and not stable_ready:
                     rospy.logwarn(
                         "[BRAKE] soft pass wp=%s dist=%.2f vel=%.2f acc=%.2f",
@@ -2298,11 +2318,17 @@ class MicroUAVStage1FSM:
                 if wp.action == "none":
                     self.next_waypoint()
                 else:
+                    rospy.loginfo(
+                        "[BRAKE_STABLE_DONE] wp=%s stable_for=%.2f/%.2f, enter HOLD then ACTION.",
+                        wp.name,
+                        stable_duration,
+                        self.scan_stable_time
+                    )
                     self.enter_nav_phase("HOLD")
 
             rospy.loginfo_throttle(
                 0.5,
-                "[POSITION_LOCK_BRAKE] wp=%s dist=%.2f eps=%.2f vel=%.2f acc=%.2f pos_ok=%s stable=%s soft=%s",
+                "[POSITION_LOCK_BRAKE] wp=%s dist=%.2f eps=%.2f vel=%.2f acc=%.2f pos_ok=%s stable=%s stable_for=%.2f/%.2f soft=%s",
                 wp.name,
                 dist,
                 arrive_eps,
@@ -2310,6 +2336,8 @@ class MicroUAVStage1FSM:
                 self.current_acc_norm,
                 str(pos_ready),
                 str(stable_ready),
+                stable_duration,
+                self.scan_stable_time,
                 str(soft_route_ready)
             )
 
