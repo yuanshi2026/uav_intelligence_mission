@@ -50,9 +50,9 @@ mission:
     max_loop_count: 8
     center_x: 4.30
     center_y: 0.00
-    radius: 1.00
+    radius: 1.20
     height: 1.35
-    circle_speed: 1.00
+    circle_speed: 1.10
     # 1m/s 绕 1m 半径圆时，向心加速度前馈为 1.00m/s^2。
     # ramp_time 控制切向加减速，1.50s 比原 2.00s 略激进，但仍避免突然满速。
     ramp_time: 1.50
@@ -145,7 +145,7 @@ mission:
 
   # 动作耗时参数
   action:
-    qr_scan_timeout: 5.00
+    qr_scan_timeout: 3.00
     # 识别到图片类别但不是目标类别时，最少确认这么久后跳过该靶。
     image_scan_time: 0.45
 
@@ -249,7 +249,7 @@ mission:
     kind: route
     control_mode: position
     action: none
-    x: 3.30
+    x: 3.10
     y: 0.00
     z: 1.35
     yaw_deg: 0.0
@@ -260,7 +260,7 @@ mission:
     kind: scan
     control_mode: fusion
     action: circle_obstacle
-    x: 3.30
+    x: 3.10
     y: 0.00
     z: 1.35
     yaw_deg: 0.0
@@ -272,7 +272,7 @@ mission:
     kind: route
     control_mode: position
     action: none
-    x: 3.30
+    x: 3.10
     y: 0.00
     z: 1.35
     yaw_deg: 0.0
@@ -288,8 +288,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 3.52
-    y: -1.77
+    x: 3.55
+    y: -1.69
     z: 1.35
     yaw_deg: 0.0
     speed: 0.90
@@ -299,8 +299,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: image_scan_maybe_drop
-    x: 3.52
-    y: -1.77
+    x: 3.55
+    y: -1.69
     z: 1.35
     yaw_deg: 0.0
     speed: 0.48
@@ -311,8 +311,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 3.52
-    y: -1.77
+    x: 3.55
+    y: -1.69
     z: 1.35
     yaw_deg: 0.0
     speed: 0.85
@@ -322,8 +322,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 1.71
-    y: -1.66
+    x: 1.75
+    y: -1.64
     z: 1.35
     yaw_deg: 0.0
     speed: 0.90
@@ -333,8 +333,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: image_scan_maybe_drop
-    x: 1.71
-    y: -1.66
+    x: 1.75
+    y: -1.64
     z: 1.35
     yaw_deg: 0.0
     speed: 0.48
@@ -345,8 +345,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 1.71
-    y: -1.66
+    x: 1.75
+    y: -1.64
     z: 1.35
     yaw_deg: 0.0
     speed: 0.85
@@ -356,8 +356,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 1.80
-    y: 1.60
+    x: 1.84
+    y: 1.58
     z: 1.35
     yaw_deg: 0.0
     speed: 1.00
@@ -367,8 +367,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: image_scan_maybe_drop
-    x: 1.80
-    y: 1.60
+    x: 1.84
+    y: 1.58
     z: 1.35
     yaw_deg: 0.0
     speed: 0.48
@@ -379,8 +379,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 1.80
-    y: 1.60
+    x: 1.84
+    y: 1.58
     z: 1.35
     yaw_deg: 0.0
     speed: 0.85
@@ -390,8 +390,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 3.60
-    y: 1.60
+    x: 3.67
+    y: 1.52
     z: 1.35
     yaw_deg: 0.0
     speed: 1.00
@@ -401,8 +401,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: image_scan_maybe_drop
-    x: 3.60
-    y: 1.60
+    x: 3.67
+    y: 1.52
     z: 1.35
     yaw_deg: 0.0
     speed: 0.48
@@ -412,8 +412,8 @@ mission:
     kind: route
     control_mode: fusion_route
     action: none
-    x: 3.60
-    y: 1.60
+    x: 3.67
+    y: 1.52
     z: 1.35
     yaw_deg: 0.0
     speed: 0.85
@@ -424,8 +424,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: none
-    x: 6.00
-    y: 1.00
+    x: 6.08
+    y: 0.88
     z: 1.35
     yaw_deg: 0.0
     speed: 0.58
@@ -436,8 +436,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: special_drop
-    x: 6.00
-    y: 1.00
+    x: 6.08
+    y: 0.88
     z: 0.75
     yaw_deg: 0.0
     speed: 0.36
@@ -448,8 +448,8 @@ mission:
     kind: scan
     control_mode: fusion
     action: none
-    x: 6.00
-    y: 1.00
+    x: 6.08
+    y: 0.88
     z: 1.35
     yaw_deg: 0.0
     speed: 0.50
@@ -537,7 +537,7 @@ mission:
     y: 0.00
     z: 1.35
     yaw_deg: -90.0
-    speed: 0.45
+    speed: 0.75
     acc: 0.35
 
   - name: LAND_FINAL_DYNAMIC
@@ -549,6 +549,6 @@ mission:
     y: 0.00
     z: 1.35
     yaw_deg: -90.0
-    speed: 0.30
+    speed: 0.45
     acc: 0.25
     hold_time: 1.00
