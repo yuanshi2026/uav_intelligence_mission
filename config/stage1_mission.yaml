@@ -217,7 +217,9 @@ mission:
     # 圆环真实视觉参数。
     # 搜索成功时用视觉动态生成 RING_PRE / RING_CENTER / RING_POST；
     # 搜索失败时按 ring_timeout_policy 决定是否走 YAML 固定兜底点。
-    ring_search_timeout: 5.0
+    ring_search_timeout: 7.0
+    ring_search_min_time: 1.00      # 远距离搜索至少多看 1 秒，再锁定动态穿环点
+    ring_search_min_stable_count: 5  # 远距离搜索要求更多稳定帧，避免单帧误锁
     ring_timeout_policy: fixed  # fixed：圆环视觉超时后继续走 YAML 固定穿环点，保证任务不断线
     ring_pre_distance: 1.00
     ring_post_distance: 0.60
@@ -502,7 +504,7 @@ mission:
     yaw_deg: -90.0
     speed: 0.58
     acc: 0.52
-    hold_time: 0.20
+    hold_time: 0.50
 
   - name: RING_PRE
     kind: scan
@@ -529,14 +531,14 @@ mission:
 
   - name: RING_POST
     kind: route
-    control_mode: fusion_route
+    control_mode: position
     action: none
     x: 6.00
     y: -2.20
     z: 1.40
     yaw_deg: -90.0
-    speed: 1.00
-    acc: 0.85
+    speed: 0.75
+    acc: 0.65
     # 06 回降落区：先走上侧安全通道，再在 x=1.0 处切到目标降落点 y，避免斜穿障碍物附近。
   - name: RING_EXIT_X
     kind: route

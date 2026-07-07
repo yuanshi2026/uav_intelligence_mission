@@ -80,6 +80,22 @@ def safe_float(value, default=0.0):
         return default
 
 
+def apply_ring_camera_mount_offsets(
+    forward_m,
+    offset_y_m,
+    offset_z_m,
+    camera_forward_offset_m=0.0,
+    camera_left_offset_m=0.0,
+    camera_up_offset_m=0.0,
+):
+    """Convert ring offsets from camera optical center to UAV body center."""
+    return (
+        float(forward_m) + float(camera_forward_offset_m),
+        float(offset_y_m) + float(camera_left_offset_m),
+        float(offset_z_m) + float(camera_up_offset_m),
+    )
+
+
 class StableCounter:
     """Tracks whether a target result stays stable across consecutive frames."""
 
@@ -215,6 +231,18 @@ class Stage1VisionNode:
         self.ring_up_from_camera_down = safe_float(
             rospy.get_param("~ring_up_from_camera_down", -1.0),
             -1.0
+        )
+        self.ring_camera_forward_offset_m = safe_float(
+            rospy.get_param("~ring_camera_forward_offset_m", 0.0),
+            0.0
+        )
+        self.ring_camera_left_offset_m = safe_float(
+            rospy.get_param("~ring_camera_left_offset_m", 0.0),
+            0.0
+        )
+        self.ring_camera_up_offset_m = safe_float(
+            rospy.get_param("~ring_camera_up_offset_m", 0.0),
+            0.0
         )
 
         # ---------- YOLO classifier ----------
@@ -1112,8 +1140,18 @@ class Stage1VisionNode:
         camera_right_m = (u - float(intr.ppx)) * forward_m / float(intr.fx)
         camera_down_m = (v - float(intr.ppy)) * forward_m / float(intr.fy)
 
-        offset_y_m = self.ring_left_from_camera_right * camera_right_m
-        offset_z_m = self.ring_up_from_camera_down * camera_down_m
+        raw_offset_y_m = self.ring_left_from_camera_right * camera_right_m
+        raw_offset_z_m = self.ring_up_from_camera_down * camera_down_m
+        raw_forward_m = forward_m
+
+        forward_m, offset_y_m, offset_z_m = apply_ring_camera_mount_offsets(
+            raw_forward_m,
+            raw_offset_y_m,
+            raw_offset_z_m,
+            self.ring_camera_forward_offset_m,
+            self.ring_camera_left_offset_m,
+            self.ring_camera_up_offset_m,
+        )
 
         stable_count = self.trackers["ring_gate"].update("ring_gate", center)
         radius_score = clamp((ring["radius"] - self.ring_min_radius_px) / 120.0, 0.0, 1.0)
@@ -1136,6 +1174,12 @@ class Stage1VisionNode:
             "forward_m": float(forward_m),
             "offset_y_m": float(offset_y_m),
             "offset_z_m": float(offset_z_m),
+            "raw_forward_m": float(raw_forward_m),
+            "raw_offset_y_m": float(raw_offset_y_m),
+            "raw_offset_z_m": float(raw_offset_z_m),
+            "ring_camera_forward_offset_m": float(self.ring_camera_forward_offset_m),
+            "ring_camera_left_offset_m": float(self.ring_camera_left_offset_m),
+            "ring_camera_up_offset_m": float(self.ring_camera_up_offset_m),
             "confidence": float(confidence),
             "stable_count": int(stable_count),
             "ring_center_px": [float(u), float(v)],

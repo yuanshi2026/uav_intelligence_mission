@@ -420,6 +420,13 @@ class MicroUAVStage1FSM:
         self.ring_align_gain = float(self.action_cfg.get("ring_align_gain", 0.75))
         self.ring_min_confidence = float(self.action_cfg.get("ring_min_confidence", 0.70))
         self.ring_min_stable_count = int(self.action_cfg.get("ring_min_stable_count", 3))
+        # 远距离圆环搜索阶段单独增加“最短观察时间”和“更高稳定帧数”。
+        # 这样 RING_SEARCH_START 不会一识别到圆环就立刻生成穿环点，
+        # 可以多看几帧，降低远距离中心点被单帧抖动带偏的概率。
+        self.ring_search_min_time = float(self.action_cfg.get("ring_search_min_time", 0.0))
+        self.ring_search_min_stable_count = int(
+            self.action_cfg.get("ring_search_min_stable_count", self.ring_min_stable_count)
+        )
         self.ring_forward_min = float(self.action_cfg.get("ring_forward_min", 0.30))
         self.ring_forward_max = float(self.action_cfg.get("ring_forward_max", 3.50))
         self.ring_min_z = float(self.action_cfg.get("ring_min_z", 1.35))
@@ -2172,7 +2179,10 @@ class MicroUAVStage1FSM:
             yaw_err = abs(wrap_pi(self.locked_yaw - self.current_yaw))
             can_skip_yaw_align = (
                 wp.action == "none" and
-                wp.control_mode == "fusion_route" and
+                (
+                    wp.control_mode == "fusion_route" or
+                    wp.name.upper() == "RING_POST"
+                ) and
                 yaw_err < self.skip_yaw_align_eps
             )
 
@@ -4484,7 +4494,20 @@ class MicroUAVStage1FSM:
         stable_count = int(data.get("stable_count", 1))
         confidence = float(data.get("confidence", 1.0))
 
-        if stable_count < self.ring_min_stable_count:
+        if elapsed < self.ring_search_min_time:
+            rospy.loginfo_throttle(
+                0.5,
+                "[RING_SEARCH_MIN_TIME_WAIT] forward=%.2f y=%.2f z=%.2f conf=%.2f elapsed=%.1f/%.1f",
+                forward_m,
+                offset_y_m,
+                offset_z_m,
+                confidence,
+                elapsed,
+                self.ring_search_min_time
+            )
+            return
+
+        if stable_count < self.ring_search_min_stable_count:
             rospy.loginfo_throttle(
                 0.5,
                 "[RING_SEARCH_STABLE_WAIT] forward=%.2f y=%.2f z=%.2f conf=%.2f stable=%d/%d",
@@ -4493,7 +4516,7 @@ class MicroUAVStage1FSM:
                 offset_z_m,
                 confidence,
                 stable_count,
-                self.ring_min_stable_count
+                self.ring_search_min_stable_count
             )
             return
 
@@ -4504,7 +4527,7 @@ class MicroUAVStage1FSM:
     def do_ring_pre_align_action(self, wp, tx, ty, tz, elapsed):
         """
         RING_PRE 二次对准：到动态预穿越点后，继续看圆环，修正左右和高度；
-        偏差足够小后，用最新视觉结果更新 RING_CENTER / RING_POST，然后连续穿越。
+        偏差足够小后直接进入穿环，不再用近距离视觉刷新 RING_CENTER / RING_POST。
         """
         self.scan_enable_pub.publish(Bool(data=True))
         self.scan_target_pub.publish(String(data="ring_gate"))
@@ -4566,11 +4589,15 @@ class MicroUAVStage1FSM:
         )
 
         if ready_to_pass:
-            # 用 RING_PRE 位置的最新视觉结果刷新 CENTER/POST；PRE 不再重写，避免来回跳。
-            self.build_dynamic_ring_points_from_vision(forward_m, offset_y_m, offset_z_m, update_pre=False)
+            # 只把 RING_PRE 当作二次确认点，不再用近距离视觉刷新 CENTER/POST/EXIT_X。
+            # 原因：RING_PRE 离圆环更近，前视画面更容易出现圆环截断、识别框变形，
+            # 若此时重新估算圆环中心，可能把已经在远距离锁定好的穿环线重新拉偏或拉近。
+            # 因此穿环中心和后方余量沿用 RING_SEARCH_START 远距离生成的动态点；
+            # 视觉失败时则沿用 YAML 固定兜底点。
             self.disable_scan_request()
             rospy.loginfo(
-                "Ring pre-align ready: forward=%.2f y=%.3f z=%.3f err=%.3f. Start passing gate.",
+                "Ring pre-align ready: forward=%.2f y=%.3f z=%.3f err=%.3f. "
+                "Start passing gate without refreshing CENTER/POST from near vision.",
                 forward_m,
                 offset_y_m,
                 offset_z_m,
