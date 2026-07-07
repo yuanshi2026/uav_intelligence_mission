@@ -1462,6 +1462,8 @@ class CircleObstacleGroundStationNode:
         ramp_t = max(self.ramp_time, 0.0)
         start_time = rospy.Time.now()
         last_report_loop = -1
+        # 每秒汇报一次真实飞行半径，用来判断实际轨迹是否切内圈。
+        last_radius_report_time = rospy.Time.now()
         self.completed_loops = 0.0
 
         rospy.loginfo(
@@ -1536,6 +1538,23 @@ class CircleObstacleGroundStationNode:
             else:
                 yaw = self.home_yaw
 
+            # 每秒打印一次真实半径：用实际 /mavros/local_position/pose 计算。
+            # real_r 长期小于 target_r，说明飞机实际在切内圈；接近 target_r 则多半是肉眼透视误判。
+            now_for_radius = rospy.Time.now()
+            if (now_for_radius - last_radius_report_time).to_sec() >= 1.0 and self.pose is not None:
+                px = self.pose.pose.position.x
+                py = self.pose.pose.position.y
+                real_r = math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+                radius_err = real_r - self.radius
+
+                radius_msg = (
+                    "STATUS：实际半径 real_r=%.3f m, 指令半径 target_r=%.3f m, 误差=%.3f m"
+                    % (real_r, self.radius, radius_err)
+                )
+                rospy.loginfo(radius_msg)
+                self.send_udp_message(self.last_ground_addr, radius_msg)
+                last_radius_report_time = now_for_radius
+
             self.publish_raw_target(x, y, z, vx, vy, vz, ax, ay, az, yaw)
             self.rate.sleep()
 
@@ -1559,6 +1578,8 @@ class CircleObstacleGroundStationNode:
         self.send_udp_message(self.last_ground_addr, "STATUS：开始固定圈数绕圆，预计 %.1f 秒" % total_time)
 
         start_time = rospy.Time.now()
+        # 固定圈数模式下也打印真实半径，方便和极限绕圈模式一致地排查。
+        last_radius_report_time = rospy.Time.now()
         while not rospy.is_shutdown():
             if self.is_land_requested() or self.request_land_if_battery_low():
                 return False
@@ -1590,6 +1611,23 @@ class CircleObstacleGroundStationNode:
                 yaw = theta + direction * math.pi / 2.0
             else:
                 yaw = self.home_yaw
+
+            # 每秒打印一次真实半径：用实际 /mavros/local_position/pose 计算。
+            # real_r 长期小于 target_r，说明飞机实际在切内圈；接近 target_r 则多半是肉眼透视误判。
+            now_for_radius = rospy.Time.now()
+            if (now_for_radius - last_radius_report_time).to_sec() >= 1.0 and self.pose is not None:
+                px = self.pose.pose.position.x
+                py = self.pose.pose.position.y
+                real_r = math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+                radius_err = real_r - self.radius
+
+                radius_msg = (
+                    "STATUS：实际半径 real_r=%.3f m, 指令半径 target_r=%.3f m, 误差=%.3f m"
+                    % (real_r, self.radius, radius_err)
+                )
+                rospy.loginfo(radius_msg)
+                self.send_udp_message(self.last_ground_addr, radius_msg)
+                last_radius_report_time = now_for_radius
 
             self.publish_raw_target(x, y, z, vx, vy, vz, ax, ay, az, yaw)
             self.rate.sleep()
