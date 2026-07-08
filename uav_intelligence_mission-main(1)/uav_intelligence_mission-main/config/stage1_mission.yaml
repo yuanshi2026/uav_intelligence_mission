@@ -160,9 +160,12 @@ mission:
     image_class_min_stable_count: 3
     # 图片靶投放高度：高空识别 + 高空瞄准锁定 XY 后，再降到这里直接投放。
     # 0.65m 比原 0.70m 更利于落点，但实飞前建议先从 0.70 -> 0.65 分两次试。
-    image_drop_z: 0.60
+    image_drop_z: 0.13
     image_descend_timeout: 2.50
-    image_descend_pos_eps: 0.12
+    image_descend_pos_eps: 0.08
+    # 新增：图片靶低空满足投放条件后，连续稳定等待这么久再真正投放。
+    # 只影响图片靶 DESCEND 阶段，不影响特殊靶和投放后等待。
+    image_pre_drop_stable_time: 0.30
 
     # 新增：类别确认后的“高空单独瞄准”阶段。
     # 注意：现在不是边识别边瞄准，而是先识别，再进入 HIGH_AIM 高空瞄准。
@@ -182,7 +185,7 @@ mission:
     image_low_no_vision_force_drop: true
     image_low_no_vision_force_wait: 0.70
     image_low_force_pos_eps: 0.18
-    image_low_force_vel: 0.20
+    image_low_force_vel: 0.15
     # 当前顺序逻辑不再进入低空对准阶段；该参数保留给旧的低空 ALIGN_DROP 逻辑兼容。
     image_align_timeout_policy: force_drop
     # 兜底：如果剩余图片靶扫描点数量 == 剩余图片靶投放物块数量，
@@ -190,7 +193,7 @@ mission:
     image_force_drop_remaining_equal: true
 
     drop_time: 1.0
-    hold_after_action: 0.25
+    hold_after_action: 0.5
     # ACTION 软判稳：防止识别/投放动作被轻微抖动无限卡住。
     action_soft_timeout: 1.50
     action_soft_pos_eps: 0.18
@@ -336,8 +339,8 @@ mission:
     y: -1.58
     z: 1.35
     yaw_deg: 0.0
-    speed: 0.48
-    acc: 0.42
+    speed: 0.30
+    acc: 0.35
     hold_time: 0.40
 
   - name: IMG2_UP
@@ -370,8 +373,8 @@ mission:
     y: -1.59
     z: 1.35
     yaw_deg: 0.0
-    speed: 0.48
-    acc: 0.42
+    speed: 0.30
+    acc: 0.35
     hold_time: 0.40
 
   - name: IMG1_UP
@@ -404,8 +407,8 @@ mission:
     y: 1.58
     z: 1.35
     yaw_deg: 0.0
-    speed: 0.48
-    acc: 0.42
+    speed: 0.30
+    acc: 0.35
     hold_time: 0.40
 
   - name: IMG3_UP
@@ -438,8 +441,8 @@ mission:
     y: 1.52
     z: 1.35
     yaw_deg: 0.0
-    speed: 0.48
-    acc: 0.42
+    speed: 0.30
+    acc: 0.35
     hold_time: 0.40
   - name: IMG4_UP
     kind: route
@@ -471,9 +474,9 @@ mission:
     action: special_drop
     x: 6.08
     y: 0.88
-    z: 0.75
+    z: 0.13
     yaw_deg: 0.0
-    speed: 0.36
+    speed: 0.30
     acc: 0.34
     hold_time: 0.35
 

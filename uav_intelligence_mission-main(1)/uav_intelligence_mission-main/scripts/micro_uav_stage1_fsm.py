@@ -312,6 +312,11 @@ class MicroUAVStage1FSM:
         self.image_drop_z = float(self.action_cfg.get("image_drop_z", 0.70))
         self.image_descend_timeout = float(self.action_cfg.get("image_descend_timeout", 2.50))
         self.image_descend_pos_eps = float(self.action_cfg.get("image_descend_pos_eps", 0.12))
+        # 图片靶低空满足投放条件后，连续稳定等待这段时间再真正投放。
+        # 这样可以避免刚降到低空、速度瞬间达标就立刻投放。
+        self.image_pre_drop_stable_time = float(
+            self.action_cfg.get("image_pre_drop_stable_time", 0.30)
+        )
         self.image_align_timeout_policy = str(
             self.action_cfg.get("image_align_timeout_policy", "force_drop")
         ).strip().lower()
@@ -528,6 +533,8 @@ class MicroUAVStage1FSM:
         # 图片靶高空瞄准锁定点。进入 DESCEND 前写入，DESCEND 阶段只围绕这个锁定点降高投放。
         self.image_locked_xy = None
         self.image_locked_xy_reason = ""
+        # 图片靶低空投放前连续稳定计时起点；只在 DESCEND 阶段使用。
+        self.image_pre_drop_stable_start_time = None
 
         # ---------- 图片靶 / 特殊靶视觉闭环缓存 ----------
         # vision_results[target] 保存 /uav/vision_result 的最近一次 JSON 结果。
@@ -1219,6 +1226,7 @@ class MicroUAVStage1FSM:
         self.pending_image_class = ""
         self.image_locked_xy = None
         self.image_locked_xy_reason = ""
+        self.image_pre_drop_stable_start_time = None
 
     def mission_z_to_abs(self, z):
         """把任务 YAML 中的高度 z 转成 MAVROS local 绝对高度。"""
@@ -1409,6 +1417,7 @@ class MicroUAVStage1FSM:
         self.pending_image_class = img_class
         self.image_action_phase = "DESCEND"
         self.image_phase_start_time = rospy.Time.now()
+        self.image_pre_drop_stable_start_time = None
         self.action_hold_target = [lock_x, lock_y, drop_abs_z]
         self.vision_results.pop("image_target", None)
         # 一进入下降阶段就关闭视觉请求，避免拍到下降过程的图片，也避免低空结果干扰控制。
@@ -3830,34 +3839,67 @@ class MicroUAVStage1FSM:
                 self.pending_drop_cmd != ""
             )
 
-            if descend_ready or timeout_force_ready:
-                if timeout_force_ready and not descend_ready:
-                    rospy.logwarn(
-                        "[IMAGE_DESCEND_TIMEOUT_FORCE_DROP] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f",
-                        wp.name,
-                        self.pending_drop_cmd,
-                        lock_x,
-                        lock_y,
-                        pos_err,
-                        z_err,
-                        self.current_speed
-                    )
-                else:
-                    rospy.loginfo(
-                        "[IMAGE_DESCEND_DROP] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f",
-                        wp.name,
-                        self.pending_drop_cmd,
-                        lock_x,
-                        lock_y,
-                        pos_err,
-                        z_err,
-                        self.current_speed
-                    )
+            pre_drop_ready = descend_ready or timeout_force_ready
 
-                if self.send_drop_once(self.pending_drop_cmd):
-                    self.mark_image_drop_done(self.pending_drop_cmd)
-                self.image_action_phase = "DROP_WAIT"
+            if pre_drop_ready:
+                if self.image_pre_drop_stable_start_time is None:
+                    self.image_pre_drop_stable_start_time = rospy.Time.now()
+
+                pre_drop_stable_elapsed = (
+                    rospy.Time.now() - self.image_pre_drop_stable_start_time
+                ).to_sec()
+
+                if pre_drop_stable_elapsed >= self.image_pre_drop_stable_time:
+                    if timeout_force_ready and not descend_ready:
+                        rospy.logwarn(
+                            "[IMAGE_DESCEND_TIMEOUT_FORCE_DROP] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f stable=%.2f/%.2f",
+                            wp.name,
+                            self.pending_drop_cmd,
+                            lock_x,
+                            lock_y,
+                            pos_err,
+                            z_err,
+                            self.current_speed,
+                            pre_drop_stable_elapsed,
+                            self.image_pre_drop_stable_time
+                        )
+                    else:
+                        rospy.loginfo(
+                            "[IMAGE_DESCEND_DROP] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f stable=%.2f/%.2f",
+                            wp.name,
+                            self.pending_drop_cmd,
+                            lock_x,
+                            lock_y,
+                            pos_err,
+                            z_err,
+                            self.current_speed,
+                            pre_drop_stable_elapsed,
+                            self.image_pre_drop_stable_time
+                        )
+
+                    if self.send_drop_once(self.pending_drop_cmd):
+                        self.mark_image_drop_done(self.pending_drop_cmd)
+                    self.image_action_phase = "DROP_WAIT"
+                    self.image_pre_drop_stable_start_time = None
+                    return
+
+                rospy.loginfo_throttle(
+                    0.3,
+                    "[IMAGE_PRE_DROP_STABLE_WAIT] wp=%s cmd=%s locked_xy=(%.3f, %.3f) pos_err=%.2f z_err=%.2f speed=%.2f stable=%.2f/%.2f",
+                    wp.name,
+                    self.pending_drop_cmd,
+                    lock_x,
+                    lock_y,
+                    pos_err,
+                    z_err,
+                    self.current_speed,
+                    pre_drop_stable_elapsed,
+                    self.image_pre_drop_stable_time
+                )
                 return
+
+            # 中途高度/位置/速度任一条件不满足，就清零重新累计，保证是“连续稳定”。
+            self.image_pre_drop_stable_start_time = None
 
             rospy.loginfo_throttle(
                 0.4,

@@ -37,6 +37,9 @@ import math
 import os
 import re
 import time
+import queue
+import threading
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -73,7 +76,7 @@ except Exception:
     trt = None
     cuda = None
 
-IMAGE_CLASS_BACKEND = "yolo"
+IMAGE_CLASS_BACKEND = "resnet_trt"
 IMAGE_CLASS_YOLO_MODEL_PATH = "/home/nvidia/catkin_ws/src/uav_inventory/models/image_target_classifier.engine"
 IMAGE_CLASS_YOLO_TASK = "classify"
 IMAGE_CLASS_YOLO_CONF = 0.25
@@ -83,6 +86,22 @@ IMAGE_CLASS_RESNET_CLASSES_PATH = "/home/nvidia/catkin_ws/src/uav_inventory/mode
 IMAGE_CLASS_RESNET_INPUT_SIZE = 224
 IMAGE_CLASS_RESNET_MEAN = [0.485, 0.456, 0.406]
 IMAGE_CLASS_RESNET_STD = [0.229, 0.224, 0.225]
+
+# =========================
+# Down camera dataset capture
+# =========================
+# 收到 /uav/scan_enable=True 后，新建一个采集文件夹；
+# 当 scan_target 属于 DOWN_CAPTURE_TARGETS 时，后台保存下视相机图像。
+# 默认只在 image_target 识别时采集，避免 QR / 特殊靶 / 圆环阶段混入太多无关图。
+DOWN_CAPTURE_ENABLE = True
+DOWN_CAPTURE_TARGETS = ["image_target"]
+DOWN_CAPTURE_ROOT = "/home/nvidia/catkin_ws/src/uav_inventory/down_capture_dataset"
+DOWN_CAPTURE_MAX_FPS = 8.0
+DOWN_CAPTURE_JPEG_QUALITY = 95
+DOWN_CAPTURE_QUEUE_SIZE = 300
+DOWN_CAPTURE_SAVE_RAW = True
+DOWN_CAPTURE_SAVE_WARP = True
+DOWN_CAPTURE_SAVE_CROP = True
 
 
 def clamp(value, min_value, max_value):
@@ -109,6 +128,22 @@ def parse_float_list(value, default):
     except Exception:
         pass
     return list(default)
+
+
+def parse_string_list(value, default):
+    """Parse ROS param list/string into a normalized string list."""
+    try:
+        if isinstance(value, (list, tuple)):
+            return [str(x).strip().lower() for x in value if str(x).strip() != ""]
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith("[") and value.endswith("]"):
+                value = value[1:-1]
+            value = value.replace(";", ",")
+            return [x.strip().strip("'\"").lower() for x in value.split(",") if x.strip() != ""]
+    except Exception:
+        pass
+    return [str(x).strip().lower() for x in default]
 
 
 class ResNetTRTClassifier:
@@ -327,6 +362,31 @@ class Stage1VisionNode:
         self.image_class_conf = float(rospy.get_param("~image_class_conf", IMAGE_CLASS_YOLO_CONF))
         self.min_result_confidence = float(rospy.get_param("~min_result_confidence", 0.20))
 
+        # ---------- Down camera dataset capture ----------
+        self.down_capture_enable = bool(rospy.get_param("~down_capture_enable", DOWN_CAPTURE_ENABLE))
+        self.down_capture_targets = parse_string_list(
+            rospy.get_param("~down_capture_targets", DOWN_CAPTURE_TARGETS),
+            DOWN_CAPTURE_TARGETS
+        )
+        self.down_capture_root = os.path.expanduser(str(rospy.get_param(
+            "~down_capture_root",
+            DOWN_CAPTURE_ROOT
+        )))
+        self.down_capture_max_fps = float(rospy.get_param("~down_capture_max_fps", DOWN_CAPTURE_MAX_FPS))
+        self.down_capture_jpeg_quality = int(rospy.get_param("~down_capture_jpeg_quality", DOWN_CAPTURE_JPEG_QUALITY))
+        self.down_capture_queue_size = int(rospy.get_param("~down_capture_queue_size", DOWN_CAPTURE_QUEUE_SIZE))
+        self.down_capture_save_raw = bool(rospy.get_param("~down_capture_save_raw", DOWN_CAPTURE_SAVE_RAW))
+        self.down_capture_save_warp = bool(rospy.get_param("~down_capture_save_warp", DOWN_CAPTURE_SAVE_WARP))
+        self.down_capture_save_crop = bool(rospy.get_param("~down_capture_save_crop", DOWN_CAPTURE_SAVE_CROP))
+        self.down_capture_active = False
+        self.down_capture_session_dir = None
+        self.down_capture_session_name = ""
+        self.down_capture_index = 0
+        self.down_capture_last_time = 0.0
+        self.down_capture_queue = None
+        self.down_capture_stop_event = threading.Event()
+        self.down_capture_thread = None
+
         # ---------- QR ----------
         self.qr_detector = cv2.QRCodeDetector()
         self.qr_valid_regex = rospy.get_param(
@@ -430,6 +490,7 @@ class Stage1VisionNode:
         rospy.Subscriber(self.scan_enable_topic, Bool, self.scan_enable_cb, queue_size=5)
         rospy.Subscriber(self.scan_target_topic, String, self.scan_target_cb, queue_size=5)
 
+        self.start_down_capture_writer()
         self.load_image_classifier()
         self.open_down_camera()
         self.open_front_realsense()
@@ -606,9 +667,21 @@ class Stage1VisionNode:
     # =========================
 
     def scan_enable_cb(self, msg):
+        previous_enabled = self.scan_enabled
         self.scan_enabled = bool(msg.data)
+
+        if self.scan_enabled and not previous_enabled:
+            self.start_new_down_capture_session()
+
         if not self.scan_enabled:
             self.reset_trackers()
+            if self.down_capture_active:
+                rospy.loginfo(
+                    "Down capture session closed: %s saved_count=%d",
+                    str(self.down_capture_session_dir),
+                    int(self.down_capture_index)
+                )
+            self.down_capture_active = False
 
     def scan_target_cb(self, msg):
         target = msg.data.strip().lower()
@@ -636,6 +709,179 @@ class Stage1VisionNode:
             "confidence": 0.0,
             "stable_count": 0
         })
+
+    # =========================
+    # Down camera dataset capture
+    # =========================
+
+    def start_down_capture_writer(self):
+        if not self.down_capture_enable:
+            rospy.loginfo("Down capture disabled by parameter.")
+            return
+
+        self.down_capture_queue = queue.Queue(maxsize=max(1, self.down_capture_queue_size))
+        self.down_capture_stop_event.clear()
+        self.down_capture_thread = threading.Thread(
+            target=self.down_capture_worker,
+            name="down_capture_writer",
+            daemon=True
+        )
+        self.down_capture_thread.start()
+
+        rospy.loginfo(
+            "Down capture enabled: root=%s targets=%s max_fps=%.1f raw=%s warp=%s crop=%s",
+            self.down_capture_root,
+            str(self.down_capture_targets),
+            self.down_capture_max_fps,
+            str(self.down_capture_save_raw),
+            str(self.down_capture_save_warp),
+            str(self.down_capture_save_crop)
+        )
+
+    def stop_down_capture_writer(self):
+        if self.down_capture_thread is None:
+            return
+
+        self.down_capture_stop_event.set()
+        try:
+            self.down_capture_thread.join(timeout=3.0)
+        except Exception:
+            pass
+        self.down_capture_thread = None
+
+    def down_capture_worker(self):
+        encode_params = [
+            int(cv2.IMWRITE_JPEG_QUALITY),
+            int(clamp(self.down_capture_jpeg_quality, 30, 100))
+        ]
+
+        while not self.down_capture_stop_event.is_set() or (
+            self.down_capture_queue is not None and not self.down_capture_queue.empty()
+        ):
+            try:
+                out_path, image = self.down_capture_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            try:
+                out_path = os.path.expanduser(str(out_path))
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                ok, encoded = cv2.imencode(".jpg", image, encode_params)
+                if ok:
+                    encoded.tofile(out_path)
+                else:
+                    rospy.logwarn_throttle(2.0, "Down capture cv2.imencode failed: %s", out_path)
+            except Exception as e:
+                rospy.logwarn_throttle(2.0, "Down capture save failed: %s", str(e))
+            finally:
+                try:
+                    self.down_capture_queue.task_done()
+                except Exception:
+                    pass
+
+    def start_new_down_capture_session(self):
+        if not self.down_capture_enable:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.down_capture_session_name = "stage1_down_capture_%s" % timestamp
+        self.down_capture_session_dir = os.path.join(self.down_capture_root, self.down_capture_session_name)
+
+        try:
+            os.makedirs(self.down_capture_session_dir, exist_ok=True)
+            if self.down_capture_save_raw:
+                os.makedirs(os.path.join(self.down_capture_session_dir, "raw"), exist_ok=True)
+            if self.down_capture_save_warp:
+                os.makedirs(os.path.join(self.down_capture_session_dir, "warp"), exist_ok=True)
+            if self.down_capture_save_crop:
+                os.makedirs(os.path.join(self.down_capture_session_dir, "crop"), exist_ok=True)
+        except Exception as e:
+            rospy.logwarn("Failed to create down capture session folder: %s", str(e))
+            self.down_capture_active = False
+            return
+
+        self.down_capture_index = 0
+        self.down_capture_last_time = 0.0
+        self.down_capture_active = True
+
+        rospy.loginfo("Down capture session started: %s", self.down_capture_session_dir)
+
+    def down_capture_should_save(self):
+        if not self.down_capture_enable:
+            return False
+        if not self.down_capture_active:
+            return False
+        if self.down_capture_queue is None:
+            return False
+
+        target = str(self.scan_target).strip().lower()
+        targets = [str(x).strip().lower() for x in self.down_capture_targets]
+        if "*" not in targets and "all" not in targets and target not in targets:
+            return False
+
+        if self.down_capture_max_fps > 0:
+            now = time.time()
+            interval = 1.0 / max(0.1, self.down_capture_max_fps)
+            if now - self.down_capture_last_time < interval:
+                return False
+            self.down_capture_last_time = now
+
+        return True
+
+    def sanitize_capture_token(self, text, default="unknown"):
+        text = str(text).strip().lower()
+        if text == "":
+            text = default
+        text = re.sub(r"[^a-zA-Z0-9_\-]+", "_", text)
+        text = text.strip("_")
+        return text if text else default
+
+    def enqueue_down_capture(self, subdir, image, filename):
+        if image is None or self.down_capture_queue is None:
+            return
+
+        out_path = os.path.join(self.down_capture_session_dir, subdir, filename)
+        try:
+            self.down_capture_queue.put_nowait((out_path, image.copy()))
+        except queue.Full:
+            rospy.logwarn_throttle(2.0, "Down capture queue full, dropping images.")
+
+    def capture_down_sample_set(self, frame, square=None, board_warp=None, class_name="unknown", reason="raw"):
+        if not self.down_capture_should_save():
+            return
+
+        if self.down_capture_session_dir is None:
+            self.start_new_down_capture_session()
+            if not self.down_capture_active:
+                return
+
+        self.down_capture_index += 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        target = self.sanitize_capture_token(self.scan_target, "target")
+        label = self.sanitize_capture_token(class_name, "unknown")
+        reason = self.sanitize_capture_token(reason, "reason")
+        prefix = "%06d_%s_%s_%s_%s" % (
+            int(self.down_capture_index),
+            ts,
+            target,
+            label,
+            reason
+        )
+
+        if self.down_capture_save_raw:
+            self.enqueue_down_capture("raw", frame, prefix + "_raw.jpg")
+
+        if board_warp is not None and self.down_capture_save_warp:
+            self.enqueue_down_capture("warp", board_warp, prefix + "_warp.jpg")
+
+        if board_warp is not None and self.down_capture_save_crop:
+            try:
+                crop = self.center_crop(board_warp, self.image_class_crop_ratio)
+                self.enqueue_down_capture("crop", crop, prefix + "_crop.jpg")
+            except Exception as e:
+                rospy.logwarn_throttle(2.0, "Down capture crop failed: %s", str(e))
 
     # =========================
     # Down camera helpers
@@ -1058,6 +1304,7 @@ class Stage1VisionNode:
     def process_image_target(self, frame):
         square = self.find_square_board(frame)
         if square is None:
+            self.capture_down_sample_set(frame, class_name="unknown", reason="square_not_found")
             self.trackers["image_target"].reset()
             self.publish_not_found("image_target", "square_not_found")
             rospy.loginfo_throttle(1.0, "[IMAGE] square not found")
@@ -1068,6 +1315,13 @@ class Stage1VisionNode:
         class_name, yolo_conf, method = self.classify_image_target(board_warp)
 
         if class_name == "":
+            self.capture_down_sample_set(
+                frame,
+                square=square,
+                board_warp=board_warp,
+                class_name="unknown",
+                reason=method
+            )
             self.trackers["image_target"].reset()
             self.publish_result({
                 "target": "image_target",
@@ -1113,6 +1367,14 @@ class Stage1VisionNode:
             offset_x_m,
             offset_y_m,
             stable_count
+        )
+
+        self.capture_down_sample_set(
+            frame,
+            square=square,
+            board_warp=board_warp,
+            class_name=class_name,
+            reason=method
         )
 
         if self.show_debug:
@@ -1478,6 +1740,7 @@ class Stage1VisionNode:
                     self.front_pipeline.stop()
                 except Exception:
                     pass
+            self.stop_down_capture_writer()
             if self.show_debug:
                 cv2.destroyAllWindows()
 
