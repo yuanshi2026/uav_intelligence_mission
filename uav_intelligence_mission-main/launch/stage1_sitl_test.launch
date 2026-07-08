@@ -1,0 +1,19 @@
+<launch>
+    <!-- 任务航点 YAML -->
+    <arg name="mission_yaml"
+         default="$(find uav_inventory)/config/stage1_mission.yaml" />
+
+    <!-- SITL 仿真可以先打开自动切 OFFBOARD 和自动解锁 -->
+    <arg name="auto_set_mode" default="true" />
+    <arg name="auto_arm" default="true" />
+
+    <node pkg="uav_inventory"
+          type="micro_uav_stage1_fsm.py"
+          name="micro_uav_stage1_fsm"
+          output="screen">
+
+        <param name="mission_yaml" value="$(arg mission_yaml)" />
+        <param name="auto_set_mode" value="$(arg auto_set_mode)" />
+        <param name="auto_arm" value="$(arg auto_arm)" />
+    </node>
+</launch>

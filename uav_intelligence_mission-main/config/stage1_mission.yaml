@@ -149,48 +149,45 @@ mission:
     # 识别到图片类别但不是目标类别时，最少确认这么久后跳过该靶。
     image_scan_time: 0.45
 
-    # 图片靶真实视觉两阶段：先在 1.35m 分类，匹配二维码才下降到 image_drop_z 对准投放。
+    # 图片靶真实视觉三阶段：
+    # 1) 先在 1.35m 高空只识别类别；
+    # 2) 类别匹配二维码后，再单独高空瞄准并锁定 XY；
+    # 3) 关闭视觉下降到 image_drop_z，到位稳定后直接投放。
     # image_class_timeout 是高空等待类别的最大时间；保留 image_class_scan_time 作为旧参数兼容别名。
-    # 高空现在不仅做分类，还会顺便瞄准并锁定 XY，因此给它稍微多一点时间。
     image_class_timeout: 1.50
     image_class_scan_time: 1.50
     image_class_min_confidence: 0.55
     image_class_min_stable_count: 3
-    # 图片靶投放高度：先在 1.35m 高空识别/瞄准，锁定 XY 后再降到这里投放。
+    # 图片靶投放高度：高空识别 + 高空瞄准锁定 XY 后，再降到这里直接投放。
     # 0.65m 比原 0.70m 更利于落点，但实飞前建议先从 0.70 -> 0.65 分两次试。
-    image_drop_z: 0.65
+    image_drop_z: 0.60
     image_descend_timeout: 2.50
     image_descend_pos_eps: 0.12
 
-    # 新增：高空扫描阶段顺便瞄准，然后锁定 XY 再下降。
-    # 目的：避免低空下视相机离地太近、看不全图片靶圆环时仍要继续依赖识别。
+    # 新增：类别确认后的“高空单独瞄准”阶段。
+    # 注意：现在不是边识别边瞄准，而是先识别，再进入 HIGH_AIM 高空瞄准。
+    # image_high_aim_timeout 是确认类别后，最多给高空瞄准等待的时间。
     image_scan_aim_enabled: true
     image_scan_aim_xy_eps: 0.08
     image_scan_aim_min_confidence: 0.55
     image_scan_aim_max_wait: 1.50
+    image_high_aim_timeout: 1.50
     image_scan_aim_required_for_drop: true
     image_scan_aim_max_shift: 0.30
     image_lock_xy_on_descend: true
 
-    # 低空阶段只允许在锁定 XY 附近小范围修正；如果低空看不全圆环/视觉丢失，
-    # 到达锁定点并稳定后直接兜底投放，避免一直等低空识别。
+    # 低空阶段不再主动瞄准；下面几个 low_* 参数只作为下降超时兜底判据保留。
+    # 下降阶段 FSM 会关闭 /uav/scan_enable，因此拍照节点不会继续采集下降过程图像。
     image_low_align_max_shift: 0.16
     image_low_no_vision_force_drop: true
     image_low_no_vision_force_wait: 0.70
     image_low_force_pos_eps: 0.18
     image_low_force_vel: 0.20
-    # 低空对准超时后，force_drop 表示已确认类别且已下降时直接投一次，尽量拿分；skip 表示跳过。
+    # 当前顺序逻辑不再进入低空对准阶段；该参数保留给旧的低空 ALIGN_DROP 逻辑兼容。
     image_align_timeout_policy: force_drop
-    # 新增兜底：如果剩余图片靶扫描点数量 == 剩余图片靶投放物块数量，
-    # 当前图片靶不再等待高空分类匹配，直接下降到低空对准投放。
+    # 兜底：如果剩余图片靶扫描点数量 == 剩余图片靶投放物块数量，
+    # 当前图片靶在高空分类超时或类别不匹配时，仍进入 HIGH_AIM 高空瞄准，然后下降投放。
     image_force_drop_remaining_equal: true
-
-    # 实飞策略：把需要投放的两个图片靶放到后两个扫描点时，
-    # 前两个图片靶只快扫 0.30s 后直接跳过，不允许下降/投放，避免视觉误识别提前投错。
-    # 后两个图片靶仍然走 remaining_equal 兜底：高空瞄准 1.50s + 低空对准 2.50s，这两个瞄准时间不变。
-    image_front_quick_skip_enabled: true
-    image_front_quick_skip_count: 2
-    image_front_quick_scan_time: 0.30
 
     drop_time: 1.0
     hold_after_action: 0.25
@@ -318,7 +315,7 @@ mission:
     # 03 图片靶真实视觉逻辑：
     # 每个候选图片靶先走 *_OVER 保持原航线，再在同坐标 *_SCAN 做高空分类。
     # 若类别不是二维码要求，SCAN 动作会在高空短扫后跳过，不下降、不投放；
-    # 若类别匹配二维码，FSM 会内部下降到 image_drop_z，对准后自动发布 image_drop_1 / image_drop_2。
+    # 若类别匹配二维码，FSM 会先高空瞄准锁定 XY，再下降到 image_drop_z 自动发布 image_drop_1 / image_drop_2。
     # 两个二维码目标都投完后，后续 *_SCAN 会在进入导航前直接跳过，*_OVER 仍保持原路线。
   - name: IMG2_OVER
     kind: route
